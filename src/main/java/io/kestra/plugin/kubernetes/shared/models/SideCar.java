@@ -1,0 +1,50 @@
+package io.kestra.plugin.kubernetes.shared.models;
+
+import java.util.Map;
+
+import io.kestra.core.models.property.Property;
+
+import io.swagger.v3.oas.annotations.media.Schema;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.extern.jackson.Jacksonized;
+import io.kestra.core.models.annotations.PluginProperty;
+
+@Getter
+@Builder
+@Jacksonized
+public class SideCar {
+    @Schema(
+        title = "Image for file sidecar",
+        description = "Container image used by the init/sidecar that handles file transfer. Defaults to busybox."
+    )
+    @Builder.Default
+    @PluginProperty(group = "advanced")
+    private Property<String> image = Property.ofValue("busybox");
+
+    @Schema(
+        title = "Configure sidecar resource requests/limits",
+        description = "Optional Kubernetes resources block applied to the file transfer sidecar."
+    )
+    @PluginProperty(group = "advanced")
+    private Property<Map<String, Object>> resources;
+
+    @Schema(
+        title = "Default spec for file transfer containers",
+        description = """
+            Overrides containerDefaultSpec for the init and sidecar containers that move files. Accepts Pod container fields such as securityContext, volumeMounts, resources, and env; useful for hardening or adding mounts used only by file transfer helpers.
+
+            Example:
+            fileSidecar:
+              defaultSpec:
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                volumeMounts:
+                  - name: tmp
+                    mountPath: /tmp
+            """
+    )
+    @PluginProperty(group = "advanced")
+    private Property<Map<String, Object>> defaultSpec;
+}

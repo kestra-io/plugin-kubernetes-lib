@@ -35,36 +35,33 @@
 </p>
 <p align="center" style="color:grey;"><i>Get started with Kestra in 3 minutes.</i></p>
 
-# Kestra Plugin Template
+# Kestra Kubernetes Shared Kernel
 
-## Why
-
-- What user problem does this solve? Teams need a concrete starting point for building and validating new Kestra plugins without recreating the same project scaffolding from scratch.
-- Why would a team adopt this plugin in a workflow? It gives plugin authors a ready-made reference repo they can adapt alongside their own build, test, and publishing workflow.
-- What operational/business outcome does it enable? It shortens plugin delivery time, reduces setup mistakes, and makes internal or partner plugin development more repeatable.
+Shared kernel library for the Kestra Kubernetes plugins. Holds code common to [plugin-kubernetes](https://github.com/kestra-io/plugin-kubernetes) (OSS) and plugin-ee-kubernetes (EE) under `io.kestra.plugin.kubernetes.shared`.
 
 ## What
 
-- Provides plugin components under `io.kestra.plugin.templates`.
-- Includes classes such as `Example`, `Trigger`.
+- `models` — `Connection`, `OAuthTokenProvider`
+- `services` — `ClientService`, `PodService`, `PodLogService`, `InstanceService`, `LoggingOutputStream`
+- `watchers` — `AbstractWatch`, `PodWatcher`
 
-## Running Kestra locally with this plugin
+Published as a plain `java-library` jar. `io.fabric8:kubernetes-client` is exposed as `api`, so consumers inherit it transitively. Both fabric8 HTTP backends ship with it: Vert.x is the default, OkHttp is selected only when a connection opts into HTTP/2 or a websocket keepalive ping.
 
-1. Build the shadow JAR: `./gradlew shadowJar`. The output lands in `build/libs/`.
-2. Run `docker compose up`. `docker-compose.yml` builds `kestra/kestra:latest` and mounts `build/libs/` to `/app/plugins/`, so Kestra picks up the jar on startup.
-3. Kestra UI is available at [localhost:8080](http://localhost:8080).
+## Why
 
-### Plugins folder gotcha
+- Removes duplicated Kubernetes client, pod, and watcher logic across the OSS and EE repos.
+- Gives one place to patch shared behavior instead of two.
 
-Mounting a host folder onto `/app/plugins/` replaces the container's plugins directory rather than adding to it. Core plugins (the ones logged as `Registered N core plugins`) are compiled into Kestra itself and aren't affected, but any additional plugin normally bundled in the base image under `/app/plugins/` (e.g. the Python script plugin) gets hidden once the mount is in place. If a flow you're testing depends on another plugin, copy its jar into `build/libs/` too before starting the container.
+## Contributing
 
-### JFR startup error
+- Only code shared by both plugin repos belongs here. Plugin-specific tasks, triggers, and models stay in their own repo.
+- The Kubernetes client version pinned here is the baseline both consumers must align to.
 
-On some hosts, `command: server local` fails with:
+## Build
+
 ```
-Unable to create JFR repository directory using base location (/tmp)
+./gradlew build
 ```
-`docker-compose.yml` works around this by mounting `/tmp` as `tmpfs`. If you build your own compose file or run Kestra via `docker run`, add the same workaround, e.g. `-v /tmp:/tmp` or `--tmpfs /tmp`. Tracked upstream in [kestra-io/kestra#17405](https://github.com/kestra-io/kestra/issues/17405).
 
 ## Documentation
 * Full documentation can be found under: [kestra.io/docs](https://kestra.io/docs)

@@ -1,7 +1,7 @@
-group: io.kestra.plugin.templates
-name: "template"
-title: "Template"
-description: "Plugin template for Kestra"
+group: io.kestra.plugin.kubernetes.shared
+name: "kubernetes-lib"
+title: "Kubernetes shared kernel"
+description: "Shared kernel library for Kestra Kubernetes plugins (OSS and EE)."
 body: ""
 videos: []
 createdBy: "Kestra Core Team"

@@ -2,12 +2,10 @@ plugins {
     id 'io.kestra.gradle.repository-conventions' version '1.2.6'
     id "com.vanniktech.maven.publish" version "0.37.0"
     id "io.kestra.gradle.inject-bom-versions" version "1.2.6"
-    id "io.kestra.gradle.plugin-doc-lint" version "1.2.6"
     id 'java-library'
     id "idea"
     id 'jacoco'
     id "com.adarshr.test-logger" version "4.0.0"
-    id "com.gradleup.shadow" version "9.5.1"
     id 'signing'
     id "com.github.ben-manes.versions" version "0.54.0"
     id 'net.researchgate.release' version '3.1.0'
@@ -31,7 +29,7 @@ java {
 }
 
 group = "io.kestra.plugin"
-description = 'Plugin template for Kestra'
+description = 'Shared kernel library for Kestra Kubernetes plugins (OSS and EE).'
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = "UTF-8"
@@ -47,10 +45,21 @@ dependencies {
     annotationProcessor "org.projectlombok:lombok"
     compileOnly "org.projectlombok:lombok"
 
-    // kestra
-    annotationProcessor group: "io.kestra", name: "processor", version: kestraVersion
+    // Kestra
     compileOnly group: "io.kestra", name: "core", version: kestraVersion
     compileOnly group: "io.kestra", name: "script", version: kestraVersion
+
+    // Logs
+    compileOnly 'org.slf4j:slf4j-api'
+
+    // Kubernetes client exposed as api so consumers (plugin-kubernetes, plugin-ee-kubernetes) inherit it transitively.
+    api 'io.fabric8:kubernetes-client:7.8.0'
+    api group: 'org.apache.commons', name: 'commons-compress'
+
+    // Both HTTP backends: ClientService pins Vert.x by default and
+    // switches to OkHttp only when a connection opts into HTTP/2 or a websocket keepalive ping.
+    implementation 'io.fabric8:kubernetes-httpclient-vertx:7.8.0'
+    implementation 'io.fabric8:kubernetes-httpclient-okhttp:7.8.0'
 }
 
 
@@ -98,6 +107,7 @@ dependencies {
     testImplementation "org.junit.jupiter:junit-jupiter-engine"
     testImplementation "org.hamcrest:hamcrest"
     testImplementation "org.hamcrest:hamcrest-library"
+    testImplementation 'org.mockito:mockito-junit-jupiter'
 }
 
 /**********************************************************************************************************************\
@@ -171,23 +181,6 @@ mavenPublishing {
 tasks.withType(GenerateModuleMetadata).configureEach {
     // Suppression this validation error as we want to enforce the Kestra platform
     suppressedValidationErrors.add('enforced-platform')
-}
-
-jar {
-    manifest {
-        attributes(
-            "X-Kestra-Name": project.name,
-            "X-Kestra-Title": "Template",
-            "X-Kestra-Group": project.group + ".templates",
-            "X-Kestra-Description": project.description,
-            "X-Kestra-Version": project.version
-        )
-    }
-}
-
-shadowJar {
-    archiveClassifier.set(null)
-    mergeServiceFiles()
 }
 
 /**********************************************************************************************************************\

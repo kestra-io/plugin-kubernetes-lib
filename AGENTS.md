@@ -1,45 +1,33 @@
-# Kestra Template Plugin
+# plugin-kubernetes-lib
 
 ## What
 
-- Provides plugin components under `io.kestra.plugin.templates`.
-- Includes classes such as `Example`, `Trigger`.
+- Shared kernel library for the Kestra Kubernetes plugins.
+- Holds code common to `plugin-kubernetes` (OSS) and `plugin-ee-kubernetes` (EE) under `io.kestra.plugin.kubernetes.shared`.
+- Published as a plain `java-library` jar. `io.fabric8:kubernetes-client` is exposed as `api`, so consumers inherit it transitively.
 
 ## Why
 
-- What user problem does this solve? Teams need a concrete starting point for building and validating new Kestra plugins without recreating the same project scaffolding from scratch.
-- Why would a team adopt this plugin in a workflow? It gives plugin authors a ready-made reference repo they can adapt alongside their own build, test, and publishing workflow.
-- What operational/business outcome does it enable? It shortens plugin delivery time, reduces setup mistakes, and makes internal or partner plugin development more repeatable.
+- Removes duplicated Kubernetes client, pod, and watcher logic across the OSS and EE repos.
+- Gives one place to patch shared behavior instead of two.
 
 ## How
 
 ### Architecture
 
-Single-module plugin. Source packages under `io.kestra.plugin`:
+Single Gradle module. No plugin tasks or triggers live here, only reusable classes consumed by the two plugin repos.
 
-- `templates`
+Source under `io.kestra.plugin.kubernetes.shared`:
 
-Infrastructure dependencies (Docker Compose services):
+- `models` — `Connection`, `OAuthTokenProvider`
+- `services` — `ClientService`, `PodService`, `PodLogService`, `InstanceService`, `LoggingOutputStream`
+- `watchers` — `AbstractWatch`, `PodWatcher`
 
-- `app`
+### Local rules
 
-### Key Plugin Classes
-
-- `io.kestra.plugin.templates.Example`
-
-### Project Structure
-
-```
-plugin-template/
-├── src/main/java/io/kestra/plugin/templates/
-├── src/test/java/io/kestra/plugin/templates/
-├── build.gradle
-└── README.md
-```
-
-## Local rules
-
-- Base the wording on the implemented packages and classes, not on template README text.
+- Only code shared by both plugin repos belongs here. Plugin-specific tasks, triggers, and models stay in their own repo.
+- Keep the shared surface minimal. If only one repo needs a class, it does not belong here.
+- The Kubernetes client version pinned here is the baseline both consumers must align to.
 
 ## References
 
