@@ -71,6 +71,10 @@ public class PodLogService implements AutoCloseable {
         AtomicBoolean started = new AtomicBoolean(false);
         AtomicReference<Instant> lastReconnection = new AtomicReference<>(Instant.now(clock));
         AtomicReference<String> lastReconnectLogKey = new AtomicReference<>();
+        // The task runs with initial delay 0, so its first tick can fire before the
+        // scheduleAtFixedRate() return value is assigned. The 404 branch reads the future
+        // through this reference, null-guarded, instead of racing on the field.
+        AtomicReference<ScheduledFuture<?>> futureRef = new AtomicReference<>();
 
         scheduledFuture = scheduledExecutor.scheduleAtFixedRate(
             () ->
@@ -129,7 +133,11 @@ public class PodLogService implements AutoCloseable {
                         } catch (KubernetesClientException e) {
                             if (e.getCode() == 404) {
                                 logger.info("Pod no longer exists, stopping log collection");
-                                scheduledFuture.cancel(false);
+                                ScheduledFuture<?> future = futureRef.get();
+                                if (future != null) {
+                                    future.cancel(false);
+                                }
+                                // else: first tick raced the assignment - the next tick sees the reference and cancels
                             } else {
                                 throw e;
                             }
@@ -143,6 +151,7 @@ public class PodLogService implements AutoCloseable {
             refreshInterval,
             TimeUnit.SECONDS
         );
+        futureRef.set(scheduledFuture);
 
         // look at exception on the main thread
         thread = Thread.ofVirtual().name("k8s-listener").start(
