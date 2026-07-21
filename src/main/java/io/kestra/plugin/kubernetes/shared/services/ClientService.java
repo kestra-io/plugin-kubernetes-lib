@@ -10,7 +10,10 @@ import io.vertx.core.Vertx;
 import io.vertx.core.VertxOptions;
 import io.vertx.core.file.FileSystemOptions;
 
-abstract public class ClientService {
+public final class ClientService {
+    private ClientService() {
+    }
+
     /**
      * One {@link Vertx} shared by every Vert.x-backed {@link KubernetesClient}, created once and
      * reused. A fresh one per task run would leak threads and off-heap memory until the pod is

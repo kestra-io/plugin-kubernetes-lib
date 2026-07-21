@@ -114,36 +114,27 @@ public class PodLogService implements AutoCloseable {
                         logger.warn("Unable to find container {}, no logs will be reported", containerName);
                     }
 
-                    try {
-                        containers.forEach(container ->
-                        {
-                            try {
-                                podLogs.add(
-                                    podResource
-                                        .inContainer(container.getName())
-                                        .usingTimestamps()
-                                        .sinceTime(
-                                            lastTimestamp != null ? lastTimestamp.plusNanos(1).toString() : null
-                                        )
-                                        .watchLog(outputStream)
-                                );
-                            } catch (KubernetesClientException e) {
-                                if (e.getCode() == 404) {
-                                    logger.info("Pod no longer exists, stopping log collection");
-                                    scheduledFuture.cancel(false);
-                                } else {
-                                    throw e;
-                                }
+                    containers.forEach(container ->
+                    {
+                        try {
+                            podLogs.add(
+                                podResource
+                                    .inContainer(container.getName())
+                                    .usingTimestamps()
+                                    .sinceTime(
+                                        lastTimestamp != null ? lastTimestamp.plusNanos(1).toString() : null
+                                    )
+                                    .watchLog(outputStream)
+                            );
+                        } catch (KubernetesClientException e) {
+                            if (e.getCode() == 404) {
+                                logger.info("Pod no longer exists, stopping log collection");
+                                scheduledFuture.cancel(false);
+                            } else {
+                                throw e;
                             }
-                        });
-                    } catch (KubernetesClientException e) {
-                        if (e.getCode() == 404) {
-                            logger.info("Pod no longer exists, stopping log collection");
-                            scheduledFuture.cancel(false);
-                        } else {
-                            throw e;
                         }
-                    }
+                    });
                 } else {
                     lastReconnectLogKey.set(null);
                 }

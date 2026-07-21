@@ -13,7 +13,10 @@ import io.kestra.core.runners.RunContext;
 import io.kestra.core.serializers.JacksonMapper;
 import io.kestra.core.utils.MapUtils;
 
-abstract public class InstanceService {
+public final class InstanceService {
+    private InstanceService() {
+    }
+
     private static final ObjectMapper mapper = JacksonMapper.ofYaml();
 
     @SuppressWarnings({ "unchecked", "rawtypes" })

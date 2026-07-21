@@ -6,11 +6,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 
@@ -29,7 +32,10 @@ import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.KubernetesClientTimeoutException;
 import io.fabric8.kubernetes.client.dsl.PodResource;
 
-abstract public class PodService {
+public final class PodService {
+    private PodService() {
+    }
+
     private static final List<String> COMPLETED_PHASES = List.of(PodPhase.SUCCEEDED.value(), PodPhase.FAILED.value(), PodPhase.UNKNOWN.value()); // see https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-phase
     private static final String SIDECAR_FILES_CONTAINER_NAME = "out-files";
 
@@ -276,26 +282,14 @@ abstract public class PodService {
      * describing the first failure found.
      */
     public static void checkContainerFailures(Pod pod, String exceptContainer, Logger logger) throws IllegalStateException {
-        if (pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
+        Optional<ContainerStatus> failed = findFailedContainer(pod, exceptContainer);
+        if (failed.isEmpty()) {
             return;
         }
 
-        pod.getStatus().getContainerStatuses().stream()
-            .filter(containerStatus -> !containerStatus.getName().equals(exceptContainer))
-            .filter(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null)
-            .filter(containerStatus -> containerStatus.getState().getTerminated().getExitCode() != 0)
-            .findFirst()
-            .ifPresent(containerStatus ->
-            {
-                ContainerStateTerminated terminated = containerStatus.getState().getTerminated();
-                String errorMsg = "Container '" + containerStatus.getName() + "' failed with exit code " +
-                    terminated.getExitCode() +
-                    (terminated.getReason() != null ? ", reason: " + terminated.getReason() : "") +
-                    (terminated.getMessage() != null ? ", message: " + terminated.getMessage() : "");
-
-                logger.error(errorMsg);
-                throw new IllegalStateException(errorMsg);
-            });
+        String errorMsg = containerFailureMessage(failed.get());
+        logger.error(errorMsg);
+        throw new IllegalStateException(errorMsg);
     }
 
     /**
@@ -303,33 +297,33 @@ abstract public class PodService {
      * carrying the log consumer, for task-runner callers.
      */
     public static void checkContainerFailures(Pod pod, String exceptContainer, Logger logger, AbstractLogConsumer defaultLogConsumer) throws TaskException {
-        if (pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
+        Optional<ContainerStatus> failed = findFailedContainer(pod, exceptContainer);
+        if (failed.isEmpty()) {
             return;
         }
 
-        try {
-            pod.getStatus().getContainerStatuses().stream()
-                .filter(containerStatus -> !containerStatus.getName().equals(exceptContainer))
-                .filter(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null)
-                .filter(containerStatus -> containerStatus.getState().getTerminated().getExitCode() != 0)
-                .findFirst()
-                .ifPresent(containerStatus ->
-                {
-                    ContainerStateTerminated terminated = containerStatus.getState().getTerminated();
-                    String errorMsg = "Container '" + containerStatus.getName() + "' failed with exit code " +
-                        terminated.getExitCode() +
-                        (terminated.getReason() != null ? ", reason: " + terminated.getReason() : "") +
-                        (terminated.getMessage() != null ? ", message: " + terminated.getMessage() : "");
+        logger.error(containerFailureMessage(failed.get()));
+        throw new TaskException(-1, defaultLogConsumer);
+    }
 
-                    logger.error(errorMsg);
-                    throw new RuntimeException(new TaskException(-1, defaultLogConsumer));
-                });
-        } catch (RuntimeException e) {
-            if (e.getCause() instanceof TaskException taskException) {
-                throw taskException;
-            }
-            throw e;
+    private static Optional<ContainerStatus> findFailedContainer(Pod pod, String exceptContainer) {
+        if (pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
+            return Optional.empty();
         }
+
+        return pod.getStatus().getContainerStatuses().stream()
+            .filter(containerStatus -> !containerStatus.getName().equals(exceptContainer))
+            .filter(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null)
+            .filter(containerStatus -> containerStatus.getState().getTerminated().getExitCode() != 0)
+            .findFirst();
+    }
+
+    private static String containerFailureMessage(ContainerStatus containerStatus) {
+        ContainerStateTerminated terminated = containerStatus.getState().getTerminated();
+        return "Container '" + containerStatus.getName() + "' failed with exit code " +
+            terminated.getExitCode() +
+            (terminated.getReason() != null ? ", reason: " + terminated.getReason() : "") +
+            (terminated.getMessage() != null ? ", message: " + terminated.getMessage() : "");
     }
 
     public static PodResource podRef(KubernetesClient client, Pod pod) {
@@ -475,13 +469,12 @@ abstract public class PodService {
             this.reason = reason;
         }
 
+        private static final Set<String> REASONS = Arrays.stream(values())
+            .map(r -> r.reason)
+            .collect(Collectors.toUnmodifiableSet());
+
         public static boolean contains(String reason) {
-            for (TransientWaitingReason r : values()) {
-                if (r.reason.equals(reason)) {
-                    return true;
-                }
-            }
-            return false;
+            return REASONS.contains(reason);
         }
     }
 

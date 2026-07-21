@@ -49,7 +49,8 @@ public class LoggingOutputStream extends java.io.OutputStream {
      *
      * @return the most recent timestamp, or null if no timestamped logs have been written
      */
-    public synchronized Instant getLastTimestamp() {
+    public Instant getLastTimestamp() {
+        // volatile read is sufficient - send() is the only writer, under its own lock
         return lastTimestamp;
     }
 
@@ -73,8 +74,15 @@ public class LoggingOutputStream extends java.io.OutputStream {
      */
     @Override
     public synchronized void write(byte[] b, int off, int len) throws IOException {
+        // Scan inline instead of delegating byte-by-byte to write(int), which would
+        // re-enter the monitor for every byte on the log ingestion hot path.
         for (int i = 0; i < len; i++) {
-            write(b[off + i]);
+            byte c = b[off + i];
+            if (c == '\n') {
+                this.send();
+            } else {
+                baos.write(c);
+            }
         }
     }
 

@@ -66,8 +66,22 @@ dependencies {
 /**********************************************************************************************************************\
  * Test
  **********************************************************************************************************************/
+configurations {
+    agent {
+        canBeResolved = true
+        canBeConsumed = true
+    }
+}
+
+dependencies {
+    // AspectJ agent for Allure test reports
+    agent "org.aspectj:aspectjweaver:1.9.25.1"
+}
+
 test {
     useJUnitPlatform()
+    jvmArgs = ["-javaagent:${configurations.agent.singleFile}"]
+    finalizedBy jacocoTestReport
 }
 
 testlogger {
@@ -108,38 +122,14 @@ dependencies {
     testImplementation "org.hamcrest:hamcrest"
     testImplementation "org.hamcrest:hamcrest-library"
     testImplementation 'org.mockito:mockito-junit-jupiter'
-}
 
-/**********************************************************************************************************************\
- * Allure Reports
- **********************************************************************************************************************/
-dependencies {
-    testImplementation enforcedPlatform("io.kestra:platform:$kestraVersion")
+    // Allure reports
     testImplementation "io.qameta.allure:allure-junit5"
-}
-
-configurations {
-    agent {
-        canBeResolved = true
-        canBeConsumed = true
-    }
-}
-
-dependencies {
-    agent "org.aspectj:aspectjweaver:1.9.25.1"
-}
-
-test {
-    jvmArgs = ["-javaagent:${configurations.agent.singleFile}"]
 }
 
 /**********************************************************************************************************************\
  * Jacoco
  **********************************************************************************************************************/
-test {
-    finalizedBy jacocoTestReport
-}
-
 jacocoTestReport {
     dependsOn test
     reports {
