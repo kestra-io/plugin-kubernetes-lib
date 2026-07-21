@@ -153,6 +153,28 @@ class OAuthTokenProviderTest {
         assertThat(provider.getCache(), is(Duration.ofMinutes(5)));
     }
 
+    // --- zero duration disables caching ---
+
+    @Test
+    void zeroCacheDurationDisablesCaching() throws Exception {
+        when(runContext.render(eq("{{ accessToken.tokenValue }}"), any()))
+            .thenReturn("token-v1")
+            .thenReturn("token-v2");
+
+        var provider = OAuthTokenProvider.builder()
+            .task(tokenTask)
+            .output("{{ accessToken.tokenValue }}")
+            .cache(Duration.ZERO)
+            .runContext(runContext)
+            .build();
+
+        provider.getToken();
+        provider.getToken();
+
+        // PT0S disables caching entirely - the task must run on every call
+        verify(tokenTask, times(2)).run(runContext);
+    }
+
     // --- negative duration disables caching ---
 
     @Test
