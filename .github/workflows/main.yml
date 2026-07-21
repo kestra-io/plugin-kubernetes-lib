@@ -43,5 +43,6 @@ jobs:
     uses: kestra-io/actions/.github/workflows/plugins.yml@main
     with:
       skip-test: ${{ github.event.inputs.skip-test == 'true' }}
-      kestra-version: ${{ github.event.inputs.kestra-version }}
+      generate-shadowjar: false
+      skip-indexing: true
     secrets: inherit
