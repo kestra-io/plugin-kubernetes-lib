@@ -28,6 +28,7 @@ Source under `io.kestra.plugin.kubernetes.shared`:
 - Only code shared by both plugin repos belongs here. Plugin-specific tasks, triggers, and models stay in their own repo.
 - Keep the shared surface minimal. If only one repo needs a class, it does not belong here.
 - The Kubernetes client version pinned here is the baseline both consumers must align to.
+- `kestraVersion` here must equal the OLDEST core supported by either consumer (currently 1.3.13, OSS). Core is `compileOnly`, so compiling against the minimum guarantees the lib never references a core API that an older Kestra server lacks. Do not bump it past a consumer's pin.
 
 ## References
 
