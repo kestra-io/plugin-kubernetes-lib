@@ -146,13 +146,13 @@ public class Connection {
             error once the initial token expires. The provider executes a Kestra task to fetch a fresh token
             each time the Kubernetes client needs to re-authenticate."""
     )
-    @PluginProperty(group = "connection")
+    @PluginProperty(secret = true, group = "connection")
     private final OAuthTokenProvider oauthTokenProvider;
 
     @Schema(
         title = "Username"
     )
-    @PluginProperty(group = "connection")
+    @PluginProperty(secret = true, group = "connection")
     private Property<String> username;
 
     @Schema(

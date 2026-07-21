@@ -113,6 +113,33 @@ class OAuthTokenProviderTest {
         verify(tokenTask, times(2)).run(runContext);
     }
 
+    // --- cache miss after a positive TTL genuinely elapses ---
+
+    @Test
+    void shouldRefetchTokenAfterPositiveTtlElapses() throws Exception {
+        when(runContext.render(eq("{{ accessToken.tokenValue }}"), any()))
+            .thenReturn("token-v1")
+            .thenReturn("token-v2");
+
+        // Short positive TTL so the cached token expires over real time,
+        // exercising the cacheExpiresAt comparison rather than the caching-disabled branch.
+        var provider = OAuthTokenProvider.builder()
+            .task(tokenTask)
+            .output("{{ accessToken.tokenValue }}")
+            .cache(Duration.ofMillis(100))
+            .runContext(runContext)
+            .build();
+
+        var first = provider.getToken();
+        Thread.sleep(200);
+        var second = provider.getToken();
+
+        assertThat(first, is("token-v1"));
+        assertThat(second, is("token-v2"));
+        // Task must run again once the cached token has expired
+        verify(tokenTask, times(2)).run(runContext);
+    }
+
     // --- default TTL ---
 
     @Test
