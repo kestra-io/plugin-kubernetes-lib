@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.List;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
 
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.executions.Execution;
@@ -21,6 +22,7 @@ import jakarta.inject.Inject;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @KestraTest
+@Isolated // testInheritClusterConfigSeedsUnsetFieldsFromAutoConfig mutates process-global kubernetes.* system properties
 class ConnectionTest {
 
     @Inject
@@ -61,6 +63,30 @@ class ConnectionTest {
 
         assertThat(connection.toConfig(runContext()).isHttp2Disable()).isTrue();
         assertThat(connection.useOkHttpBackend(runContext())).isFalse();
+    }
+
+    @Test
+    void testInheritClusterConfigSeedsUnsetFieldsFromAutoConfig() throws Exception {
+        // inheritClusterConfig=true seeds unset fields from ambient auto-config; false (default) starts
+        // blank, the prior behavior (non-breaking). kube config + service account loading are disabled
+        // so only the sys-prop master URL feeds auto-config (deterministic on any machine); masterUrl
+        // is nulled so the seeded value shows through.
+        System.setProperty("kubernetes.auth.tryKubeConfig", "false");
+        System.setProperty("kubernetes.auth.tryServiceAccount", "false");
+        System.setProperty("kubernetes.master", "https://seed-from-autoconfig:6443");
+        try {
+            var connection = Connection.builder()
+                .masterUrl(null)
+                .enableHttp2(Property.ofValue(true))
+                .build();
+
+            assertThat(connection.toConfig(runContext(), true).getMasterUrl()).contains("seed-from-autoconfig:6443");
+            assertThat(connection.toConfig(runContext(), false).getMasterUrl()).doesNotContain("seed-from-autoconfig");
+        } finally {
+            System.clearProperty("kubernetes.master");
+            System.clearProperty("kubernetes.auth.tryKubeConfig");
+            System.clearProperty("kubernetes.auth.tryServiceAccount");
+        }
     }
 
     @Test

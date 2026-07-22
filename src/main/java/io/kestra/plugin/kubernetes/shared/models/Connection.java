@@ -205,7 +205,13 @@ public class Connection {
     private final Property<Duration> websocketPingInterval;
 
     public Config toConfig(RunContext runContext) throws IllegalVariableEvaluationException {
-        ConfigBuilder builder = new ConfigBuilder(Config.empty());
+        return toConfig(runContext, false);
+    }
+
+    public Config toConfig(RunContext runContext, boolean inheritClusterConfig) throws IllegalVariableEvaluationException {
+        // inheritClusterConfig seeds the base from ambient auto-config (system props / env / kubeconfig /
+        // in-cluster SA) instead of blank, so explicit fields override while the rest stays resolved.
+        ConfigBuilder builder = new ConfigBuilder(inheritClusterConfig ? Config.autoConfigure(null) : Config.empty());
 
         if (trustCerts != null) {
             boolean trustCertsValue = runContext.render(trustCerts).as(Boolean.class).orElseThrow();
