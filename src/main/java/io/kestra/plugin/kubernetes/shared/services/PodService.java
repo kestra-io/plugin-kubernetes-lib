@@ -4,11 +4,13 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -24,6 +26,7 @@ import io.kestra.core.models.tasks.runners.TaskException;
 import io.kestra.core.runners.RunContext;
 import io.kestra.core.utils.RetryUtils;
 import io.kestra.plugin.kubernetes.shared.models.Connection;
+import io.kestra.plugin.kubernetes.shared.models.SideCar;
 
 import io.fabric8.kubernetes.api.model.*;
 import io.fabric8.kubernetes.client.Config;
@@ -457,6 +460,57 @@ public final class PodService {
 
     public static Path tempDir(RunContext runContext) {
         return runContext.workingDir().path().resolve("working-dir");
+    }
+
+    /**
+     * Moves a file, creating the destination's parent directories if needed.
+     */
+    public static void moveFile(Path from, Path to) throws IOException {
+        if (Files.notExists(to.getParent())) {
+            Files.createDirectories(to.getParent());
+        }
+        Files.move(from, to, StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    /**
+     * Maps a sidecar's rendered resources block to Kubernetes {@link ResourceRequirements}.
+     *
+     * @return the resource requirements, or null when the sidecar defines none
+     */
+    @SuppressWarnings("unchecked")
+    public static ResourceRequirements mapSidecarResources(RunContext runContext, SideCar sideCar) throws IllegalVariableEvaluationException {
+        if (sideCar == null) {
+            return null;
+        }
+
+        Map<String, Object> sidecarResources = runContext.render(sideCar.getResources()).asMap(String.class, Object.class);
+        if (sidecarResources == null) {
+            return null;
+        }
+
+        ResourceRequirementsBuilder resourceRequirementsBuilder = new ResourceRequirementsBuilder();
+        if (sidecarResources.containsKey("claims")) {
+            try {
+                resourceRequirementsBuilder.withClaims((List<ResourceClaim>) sidecarResources.get("claims"));
+            } catch (ClassCastException e) {
+                throw new IllegalArgumentException("Sidecar resources claims must be a list of resource claims");
+            }
+        }
+        if (sidecarResources.containsKey("limits")) {
+            try {
+                resourceRequirementsBuilder.withLimits((Map<String, Quantity>) sidecarResources.get("limits"));
+            } catch (ClassCastException e) {
+                throw new IllegalArgumentException("Sidecar resources limits must be a map of string to quantity");
+            }
+        }
+        if (sidecarResources.containsKey("requests")) {
+            try {
+                resourceRequirementsBuilder.withRequests((Map<String, Quantity>) sidecarResources.get("requests"));
+            } catch (ClassCastException e) {
+                throw new IllegalArgumentException("Sidecar resources requests must be a map of string to quantity");
+            }
+        }
+        return resourceRequirementsBuilder.build();
     }
 
     public enum TransientWaitingReason {

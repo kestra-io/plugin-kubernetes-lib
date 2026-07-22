@@ -32,6 +32,43 @@ public final class InstanceService {
         return fromMap(cls, runContext, additionalVars, MapUtils.merge(map, defaults));
     }
 
+    /**
+     * Converts a Kubernetes object to a Map for merging purposes.
+     */
+    public static Map<String, Object> containerToMap(Object obj) {
+        if (obj == null) {
+            return new HashMap<>();
+        }
+        try {
+            String yaml = JacksonMapper.ofYaml().writeValueAsString(obj);
+            return JacksonMapper.ofYaml().readValue(yaml, new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {
+            });
+        } catch (Exception e) {
+            return new HashMap<>();
+        }
+    }
+
+    /**
+     * Deep merges two maps. Values from the override map take precedence.
+     * For nested maps, recursively merges. For other values, override wins.
+     */
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> deepMerge(Map<String, Object> base, Map<String, Object> override) {
+        Map<String, Object> result = new HashMap<>(base);
+        for (Map.Entry<String, Object> entry : override.entrySet()) {
+            String key = entry.getKey();
+            Object overrideValue = entry.getValue();
+            Object baseValue = result.get(key);
+
+            if (overrideValue instanceof Map && baseValue instanceof Map) {
+                result.put(key, deepMerge((Map<String, Object>) baseValue, (Map<String, Object>) overrideValue));
+            } else if (overrideValue != null) {
+                result.put(key, overrideValue);
+            }
+        }
+        return result;
+    }
+
     @SuppressWarnings("unchecked")
     private static Map<Object, Object> render(RunContext runContext, Map<String, Object> additionalVars, Map<Object, Object> map) throws IllegalVariableEvaluationException {
         Map<Object, Object> copy = new HashMap<>();
