@@ -55,6 +55,8 @@ public final class PodService {
 
     private static final int UPLOAD_RETRY_MAX_ATTEMPTS = 5;
 
+    public static final Duration DEFAULT_RETRY_MAX_DURATION = Duration.ofSeconds(60);
+
     public static KubernetesClient client(RunContext runContext, Connection connection) throws IllegalVariableEvaluationException {
         return client(runContext, connection, false);
     }
@@ -347,9 +349,19 @@ public final class PodService {
     }
 
     /**
-     * Retry file operations with exponential backoff optimized for freshly provisioned nodes.
+     * Retry file operations with exponential backoff optimized for freshly provisioned nodes,
+     * capped at a 60s budget.
      */
     public static Boolean withRetries(Logger logger, String where, RetryUtils.CheckedSupplier<Boolean> call) throws IOException {
+        return withRetries(logger, where, call, DEFAULT_RETRY_MAX_DURATION);
+    }
+
+    /**
+     * Retry file operations with exponential backoff, capped at {@code maxDuration}. Use a shorter
+     * budget on best-effort paths (e.g. output-file download from an already-failed pod) so a call
+     * that cannot succeed does not burn the full default window.
+     */
+    public static Boolean withRetries(Logger logger, String where, RetryUtils.CheckedSupplier<Boolean> call, Duration maxDuration) throws IOException {
         var attempt = new AtomicInteger(0);
         try {
             return RetryUtils.Instance.<Boolean, IOException> builder()
@@ -358,7 +370,7 @@ public final class PodService {
                         .delayFactor(2.0)
                         .interval(Duration.ofSeconds(1))
                         .maxInterval(Duration.ofSeconds(10))
-                        .maxDuration(Duration.ofSeconds(60))
+                        .maxDuration(maxDuration)
                         .maxAttempts(UPLOAD_RETRY_MAX_ATTEMPTS)
                         .build()
                 )
