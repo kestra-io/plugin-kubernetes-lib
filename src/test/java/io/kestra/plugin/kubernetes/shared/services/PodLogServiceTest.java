@@ -27,8 +27,10 @@ import io.fabric8.kubernetes.client.dsl.NonNamespaceOperation;
 import io.fabric8.kubernetes.client.dsl.PodResource;
 import io.fabric8.kubernetes.client.dsl.TimestampBytesLimitTerminateTimeTailPrettyLoggable;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -208,5 +210,29 @@ public class PodLogServiceTest {
         Mockito.verify(logger, Mockito.never()).debug(eq("{} cancelled"), anyString(), any(CancellationException.class));
         Mockito.verify(logger, Mockito.never()).debug(eq("{} interrupted"), anyString(), any(InterruptedException.class));
         Mockito.verify(logger, Mockito.never()).error(eq("{} exception"), anyString(), any(Throwable.class));
+    }
+
+    @Test
+    void fetchFinalLogsWarnsWhenNoLogConsumerIsSet() {
+        KubernetesClient client = mock(KubernetesClient.class);
+        Pod pod = mock(Pod.class);
+
+        when(pod.getMetadata()).thenReturn(
+            new ObjectMetaBuilder().withNamespace("default").withName("test-pod").build()
+        );
+
+        RunContext runContext = mock(RunContext.class);
+        Logger logger = mock(Logger.class);
+        when(runContext.logger()).thenReturn(logger);
+
+        // no setLogConsumer() / watch() call: this reproduces the ordering bug where
+        // fetchFinalLogs() ran before the consumer was wired up
+        PodLogService svc = new PodLogService();
+
+        assertDoesNotThrow(() -> svc.fetchFinalLogs(client, pod, runContext));
+
+        Mockito.verify(logger).warn(contains("no log consumer was set"), eq("test-pod"));
+        // it must stay a dead end, just a loud one: no API call is attempted
+        Mockito.verifyNoInteractions(client);
     }
 }
