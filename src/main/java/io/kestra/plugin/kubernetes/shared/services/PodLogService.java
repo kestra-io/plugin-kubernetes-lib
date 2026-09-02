@@ -186,9 +186,7 @@ public class PodLogService implements AutoCloseable {
     public void fetchFinalLogs(KubernetesClient client, Pod pod, RunContext runContext) {
         if (outputStream == null) {
             if (logConsumer == null) {
-                // Loud on purpose: a missing consumer means every container log for this pod is
-                // dropped, and the only previous fingerprint was the absence of the debug line
-                // below - which cost two customer escalations to diagnose.
+                // Loud on purpose: a silent return here previously cost two escalations to diagnose.
                 runContext.logger().warn(
                     "Cannot fetch final logs for pod '{}': no log consumer was set, container output for this pod will be lost. "
                     + "This indicates setLogConsumer() was not called before fetchFinalLogs().",
