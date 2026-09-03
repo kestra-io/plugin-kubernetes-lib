@@ -21,8 +21,8 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 /**
  * The logger handed to a watch is the user-facing runContext one, so a closed watch must never be
- * logged at ERROR: watches are diagnostic only, and an ERROR entry on an otherwise successful
- * execution shows up as a bare "Error" label in the UI (kestra-ee#8204).
+ * logged at ERROR: watches are diagnostic only, and an ERROR entry there misrepresents an execution
+ * that succeeded as one that failed.
  * <p>
  * Every test closes with {@link org.mockito.Mockito#verifyNoMoreInteractions} rather than
  * {@code never()} on individual overloads: {@code Logger} has one method per arity, so a

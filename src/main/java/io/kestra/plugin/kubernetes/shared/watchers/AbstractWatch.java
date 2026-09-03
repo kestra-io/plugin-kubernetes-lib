@@ -26,9 +26,9 @@ abstract public class AbstractWatch<T> implements io.fabric8.kubernetes.client.W
     /**
      * A closed watch never fails the task: watches are diagnostic only here, every wait and completion
      * decision is taken by polling in PodService. So a close is reported below ERROR level — the logger
-     * is the user-facing runContext one, and an ERROR entry on an otherwise successful execution shows
-     * up as a bare "Error" label in the UI (kestra-ee#8204). It had no content at all on the HTTP 410
-     * path, where fabric8 builds the exception from the API server Status whose message is null.
+     * is the user-facing runContext one, and an ERROR entry there misrepresents an execution that
+     * succeeded as one that failed. It can even carry no text at all: on the HTTP 410 path fabric8
+     * builds the exception from the API server Status, whose message is nullable.
      */
     public void onClose(WatcherException e) {
         if (e == null) {
