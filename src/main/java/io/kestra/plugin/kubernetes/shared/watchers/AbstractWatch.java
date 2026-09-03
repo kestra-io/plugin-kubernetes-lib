@@ -36,11 +36,9 @@ abstract public class AbstractWatch<T> implements io.fabric8.kubernetes.client.W
             return;
         }
 
-        // Routine: the API server ends watches whose resourceVersion went stale, and fabric8 also
-        // synthesizes a 410 when a watch ends cleanly without ever delivering a message.
-        if (hasHttpGoneCause(e)) {
+        if (isRoutineClose(e)) {
             logger.debug(
-                "Watch on [Type: {}] was closed by the API server (410 Gone): {}",
+                "Watch on [Type: {}] was closed: {}",
                 this.getClass().getSimpleName(),
                 describe(e)
             );
@@ -53,6 +51,18 @@ abstract public class AbstractWatch<T> implements io.fabric8.kubernetes.client.W
             describe(e),
             e
         );
+    }
+
+    /**
+     * Two closes are routine, and neither says anything about the task. An HTTP 410 Gone: the API server
+     * ends watches whose resourceVersion went stale, and fabric8 also synthesizes a 410 when a watch ends
+     * cleanly without ever delivering a message. And exhausted reconnects, which fabric8 reports with no
+     * cause attached — the client stopped retrying this watch, while the polling that actually drives the
+     * task carries on. What is left always carries a cause and is a client-side malfunction: an unhandled
+     * exception thrown during a reconnect attempt, or a watch response that could not be parsed.
+     */
+    private static boolean isRoutineClose(WatcherException e) {
+        return e.getCause() == null || hasHttpGoneCause(e);
     }
 
     /**

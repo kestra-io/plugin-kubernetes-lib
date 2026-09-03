@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.slf4j.Logger;
 
+import java.net.ProtocolException;
+
 import io.fabric8.kubernetes.api.model.StatusBuilder;
 import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.WatcherException;
@@ -65,10 +67,31 @@ class AbstractWatchTest {
         assertThat(description.getValue().toString(), containsString("Expired"));
     }
 
+    /**
+     * The client giving up on retrying this watch says nothing about the task, whose progress is driven
+     * by polling — so it stays out of the user-facing logs, as the 410 does. fabric8 reports it with no
+     * cause attached, which is how it is told apart from a client-side malfunction.
+     */
+    @Test
+    void exhaustedReconnectsIsOnlyDebugged() {
+        Logger logger = mock(Logger.class);
+
+        new TestWatch(logger).onClose(new WatcherException("Exhausted reconnects"));
+
+        ArgumentCaptor<Object> description = ArgumentCaptor.forClass(Object.class);
+        verify(logger).debug(anyString(), any(), description.capture());
+        verifyNoMoreInteractions(logger);
+
+        assertThat(description.getValue().toString(), containsString("Exhausted reconnects"));
+    }
+
     @Test
     void unexpectedCloseIsWarnedWithItsMessage() {
         Logger logger = mock(Logger.class);
-        WatcherException exception = new WatcherException("Exhausted reconnects");
+        WatcherException exception = new WatcherException(
+            "Could not process Watch response",
+            new ProtocolException("unexpected frame")
+        );
 
         new TestWatch(logger).onClose(exception);
 
@@ -76,7 +99,7 @@ class AbstractWatchTest {
         verify(logger).warn(anyString(), any(), description.capture(), any());
         verifyNoMoreInteractions(logger);
 
-        assertThat(description.getValue().toString(), containsString("Exhausted reconnects"));
+        assertThat(description.getValue().toString(), containsString("Could not process Watch response"));
     }
 
     @Test
