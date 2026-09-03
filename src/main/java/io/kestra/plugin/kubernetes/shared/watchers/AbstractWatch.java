@@ -2,6 +2,7 @@ package io.kestra.plugin.kubernetes.shared.watchers;
 
 import org.slf4j.Logger;
 
+import io.fabric8.kubernetes.api.model.Status;
 import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.WatcherException;
 
@@ -37,7 +38,7 @@ abstract public class AbstractWatch<T> implements io.fabric8.kubernetes.client.W
 
         // Routine: the API server ends watches whose resourceVersion went stale, and fabric8 also
         // synthesizes a 410 when a watch ends cleanly without ever delivering a message.
-        if (isHttpGone(e)) {
+        if (hasHttpGoneCause(e)) {
             logger.debug(
                 "Watch on [Type: {}] was closed by the API server (410 Gone): {}",
                 this.getClass().getSimpleName(),
@@ -59,13 +60,15 @@ abstract public class AbstractWatch<T> implements io.fabric8.kubernetes.client.W
      * {@code int} on the non-410 branch, so a cause carrying a Status with no code would throw from this
      * callback. The cause we get on the 410 paths is always a {@link KubernetesClientException}.
      */
-    private static boolean isHttpGone(WatcherException e) {
+    private static boolean hasHttpGoneCause(WatcherException e) {
         return e.getCause() instanceof KubernetesClientException clientException
             && clientException.getCode() == HTTP_GONE;
     }
 
     /**
-     * A non-blank description of the close, since the exception message is null on the 410 paths.
+     * A non-blank description of the close, since the exception message is null on the 410 paths — where
+     * the cause is a KubernetesClientException with no message of its own either, so falling back to
+     * {@link Throwable#toString()} would print a bare class name. Describe the API server Status instead.
      */
     private static String describe(WatcherException e) {
         if (e.getMessage() != null && !e.getMessage().isBlank()) {
@@ -74,7 +77,24 @@ abstract public class AbstractWatch<T> implements io.fabric8.kubernetes.client.W
 
         return e.getRawWatchMessage()
             .filter(rawWatchMessage -> !rawWatchMessage.isBlank())
-            .orElseGet(() -> e.getCause() != null ? e.getCause().toString() : "no message");
+            .orElseGet(() -> describeCause(e.getCause()));
+    }
+
+    private static String describeCause(Throwable cause) {
+        if (cause == null) {
+            return "no message";
+        }
+
+        if (cause instanceof KubernetesClientException clientException && cause.getMessage() == null) {
+            Status status = clientException.getStatus();
+
+            if (status != null) {
+                return "code " + clientException.getCode()
+                    + (status.getReason() == null ? "" : ", reason " + status.getReason());
+            }
+        }
+
+        return cause.toString();
     }
 
     abstract protected String logContext(T resource);

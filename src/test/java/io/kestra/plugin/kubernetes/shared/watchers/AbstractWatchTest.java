@@ -14,13 +14,18 @@ import static org.hamcrest.Matchers.not;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 /**
  * The logger handed to a watch is the user-facing runContext one, so a closed watch must never be
  * logged at ERROR: watches are diagnostic only, and an ERROR entry on an otherwise successful
  * execution shows up as a bare "Error" label in the UI (kestra-ee#8204).
+ * <p>
+ * Every test closes with {@link org.mockito.Mockito#verifyNoMoreInteractions} rather than
+ * {@code never()} on individual overloads: {@code Logger} has one method per arity, so a
+ * {@code never()} check pins the overload it happens to resolve to and would stay green if a
+ * regression logged the error through a different one.
  */
 class AbstractWatchTest {
     private static class TestWatch extends AbstractWatch<String> {
@@ -36,7 +41,7 @@ class AbstractWatchTest {
 
     /**
      * How fabric8 reports a watch the API server ended because the resourceVersion went stale: the
-     * Status carries no message, so the exception message is null.
+     * Status carries no message, so both the exception message and the cause's message are null.
      */
     private static WatcherException httpGoneWithoutMessage() {
         return new WatcherException(
@@ -46,14 +51,18 @@ class AbstractWatchTest {
     }
 
     @Test
-    void httpGoneCloseIsNotUserFacing() {
+    void httpGoneCloseIsOnlyDebugged() {
         Logger logger = mock(Logger.class);
 
         new TestWatch(logger).onClose(httpGoneWithoutMessage());
 
-        verify(logger, never()).error(any(), any(Object[].class));
-        verify(logger, never()).error(anyString(), any(Throwable.class));
-        verify(logger, never()).warn(anyString(), any(), any());
+        ArgumentCaptor<Object> description = ArgumentCaptor.forClass(Object.class);
+        verify(logger).debug(anyString(), any(), description.capture());
+        verifyNoMoreInteractions(logger);
+
+        // A bare Throwable.toString() would only print the exception class name here.
+        assertThat(description.getValue().toString(), containsString("code 410"));
+        assertThat(description.getValue().toString(), containsString("Expired"));
     }
 
     @Test
@@ -65,10 +74,9 @@ class AbstractWatchTest {
 
         ArgumentCaptor<Object> description = ArgumentCaptor.forClass(Object.class);
         verify(logger).warn(anyString(), any(), description.capture(), any());
-        assertThat(description.getValue().toString(), containsString("Exhausted reconnects"));
+        verifyNoMoreInteractions(logger);
 
-        verify(logger, never()).error(any(), any(Object[].class));
-        verify(logger, never()).error(anyString(), any(Throwable.class));
+        assertThat(description.getValue().toString(), containsString("Exhausted reconnects"));
     }
 
     @Test
@@ -79,18 +87,19 @@ class AbstractWatchTest {
 
         ArgumentCaptor<Object> description = ArgumentCaptor.forClass(Object.class);
         verify(logger).warn(anyString(), any(), description.capture(), any());
+        verifyNoMoreInteractions(logger);
+
         assertThat(description.getValue().toString(), containsString("socket died"));
         assertThat(description.getValue().toString(), not(containsString("null")));
     }
 
     @Test
-    void nullCloseExceptionIsIgnored() {
+    void nullCloseExceptionIsOnlyDebugged() {
         Logger logger = mock(Logger.class);
 
         new TestWatch(logger).onClose((WatcherException) null);
 
-        verify(logger, never()).error(any(), any(Object[].class));
-        verify(logger, never()).error(anyString(), any(Throwable.class));
-        verify(logger, never()).warn(anyString(), any(), any(), any());
+        verify(logger).debug(anyString(), any(Object.class));
+        verifyNoMoreInteractions(logger);
     }
 }
