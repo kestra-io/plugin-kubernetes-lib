@@ -52,13 +52,13 @@ dependencies {
     compileOnly 'org.slf4j:slf4j-api'
 
     // Kubernetes client exposed as api so consumers (plugin-kubernetes, plugin-ee-kubernetes) inherit it transitively.
-    api 'io.fabric8:kubernetes-client:7.8.0'
+    api 'io.fabric8:kubernetes-client:7.9.0'
     api group: 'org.apache.commons', name: 'commons-compress'
 
     // Both HTTP backends: ClientService pins Vert.x by default and
     // switches to OkHttp only when a connection opts into HTTP/2 or a websocket keepalive ping.
-    implementation 'io.fabric8:kubernetes-httpclient-vertx:7.8.0'
-    implementation 'io.fabric8:kubernetes-httpclient-okhttp:7.8.0'
+    implementation 'io.fabric8:kubernetes-httpclient-vertx:7.9.0'
+    implementation 'io.fabric8:kubernetes-httpclient-okhttp:7.9.0'
 }
 
 
