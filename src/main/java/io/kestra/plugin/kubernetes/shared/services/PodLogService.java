@@ -127,6 +127,15 @@ public class PodLogService implements AutoCloseable {
                             podLogs.add(
                                 podResource
                                     .inContainer(container.getName())
+                                    // The runner already waits for the pod to become Ready with its full
+                                    // waitUntilRunning budget (PodService#waitForPodReady /
+                                    // waitForContainersStartedOrCompleted) before log streaming starts, so
+                                    // fabric8's internal pod-Ready re-wait here is redundant dead-time. Left
+                                    // enabled, it defaults to the global 30s request timeout set in
+                                    // PodService#client() and silently truncates that budget. This path already
+                                    // tolerates transient stream failures via the scheduled re-poll / 404
+                                    // handling above, so attaching without the redundant ready-wait is safe.
+                                    .withReadyWaitTimeout(0)
                                     .usingTimestamps()
                                     .sinceTime(
                                         lastTimestamp != null ? lastTimestamp.plusNanos(1).toString() : null
@@ -217,6 +226,10 @@ public class PodLogService implements AutoCloseable {
             try {
                 String logs = podResource
                     .inContainer(container.getName())
+                    // See withReadyWaitTimeout(0) comment on watchLog() above: the pod is already
+                    // known Ready by the time we fetch final logs, so skip fabric8's redundant
+                    // internal pod-Ready wait to avoid inheriting the 30s global request timeout.
+                    .withReadyWaitTimeout(0)
                     .usingTimestamps()
                     .sinceTime(lookbackTime != null ? lookbackTime.toString() : null)
                     .getLog();

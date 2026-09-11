@@ -87,6 +87,7 @@ class PodLogServiceAllContainersTest {
         var logWatch = mock(LogWatch.class);
 
         when(podResource.inContainer("main")).thenReturn(containerResource);
+        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
         when(containerResource.usingTimestamps()).thenReturn(logBuilder);
         when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
         when(logBuilder.watchLog(any())).thenReturn(logWatch);
@@ -253,6 +254,7 @@ class PodLogServiceAllContainersTest {
         var logBuilder = mock(TimestampBytesLimitTerminateTimeTailPrettyLoggable.class);
 
         when(podResource.inContainer("main")).thenReturn(containerResource);
+        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
         when(containerResource.usingTimestamps()).thenReturn(logBuilder);
         when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
         when(logBuilder.watchLog(any())).thenThrow(

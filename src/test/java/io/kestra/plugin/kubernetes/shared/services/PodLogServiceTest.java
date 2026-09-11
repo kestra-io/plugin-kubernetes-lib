@@ -70,6 +70,7 @@ public class PodLogServiceTest {
         var logWatch = mock(LogWatch.class);
 
         when(podResource.inContainer("main")).thenReturn(containerResource);
+        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
         when(containerResource.usingTimestamps()).thenReturn(logBuilder);
         when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
         when(logBuilder.watchLog(any())).thenReturn(logWatch);
@@ -138,6 +139,7 @@ public class PodLogServiceTest {
         var logWatch = mock(LogWatch.class);
 
         when(podResource.inContainer("main")).thenReturn(containerResource);
+        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
         when(containerResource.usingTimestamps()).thenReturn(logBuilder);
         when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
         when(logBuilder.watchLog(any())).thenReturn(logWatch);
@@ -190,6 +192,7 @@ public class PodLogServiceTest {
         var logWatch = mock(LogWatch.class);
 
         when(podResource.inContainer("main")).thenReturn(containerResource);
+        when(containerResource.withReadyWaitTimeout(0)).thenReturn(containerResource);
         when(containerResource.usingTimestamps()).thenReturn(logBuilder);
         when(logBuilder.sinceTime(any())).thenReturn(logBuilder);
         when(logBuilder.watchLog(any())).thenReturn(logWatch);
