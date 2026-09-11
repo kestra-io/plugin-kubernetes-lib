@@ -5,6 +5,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
@@ -20,6 +21,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 
@@ -38,6 +40,7 @@ import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.KubernetesClientTimeoutException;
 import io.fabric8.kubernetes.client.dsl.ContainerResource;
+import io.fabric8.kubernetes.client.dsl.CopyOrReadable;
 import io.fabric8.kubernetes.client.dsl.PodResource;
 
 public final class PodService {
@@ -56,6 +59,12 @@ public final class PodService {
     private static final int UPLOAD_RETRY_MAX_ATTEMPTS = 5;
 
     public static final Duration DEFAULT_RETRY_MAX_DURATION = Duration.ofSeconds(60);
+
+    private static final String INIT_FILES_CONTAINER_NAME = "init-files";
+
+    private static final String READY_MARKER = "ready";
+
+    private static final Duration UPLOAD_VERIFICATION_TIMEOUT = Duration.ofSeconds(10);
 
     public static KubernetesClient client(RunContext runContext, Connection connection) throws IllegalVariableEvaluationException {
         return client(runContext, connection, false);
@@ -503,6 +512,219 @@ public final class PodService {
     @FunctionalInterface
     public interface CheckedRunnable {
         void run() throws IOException;
+    }
+
+    /**
+     * Uploads a task's input files into the init-files container so they are available in the main
+     * container's working directory before it starts.
+     * <p>
+     * Entries are grouped by their top-level path segment. Whenever that top-level entry is a local
+     * directory, it is uploaded in a single tar transfer rather than one file at a time — exec/copy
+     * round-trips to the pod are the dominant cost for large directories (e.g. a Python virtualenv or
+     * node_modules), and tar preserves symlinks as their own entry instead of dereferencing them.
+     * fabric8's tar-based directory upload can report success even when the transfer was silently
+     * truncated on a slow or contended cluster, so every bulk upload is cross-checked against the
+     * pod-side file count ({@link #verifyDirectoryUpload}) and falls back to a slower, individually
+     * verified per-file (or per-directory) upload when the counts disagree.
+     *
+     * @param localBaseDir the local directory that {@code relativePaths} are resolved against
+     * @param containerWorkingDir the working directory inside the init-files container that
+     *                             {@code relativePaths} are uploaded under
+     * @param relativePaths the input files/directories to upload, relative to {@code localBaseDir}
+     */
+    public static void uploadInputFiles(
+        RunContext runContext,
+        PodResource podResource,
+        Logger logger,
+        Path localBaseDir,
+        Path containerWorkingDir,
+        List<Path> relativePaths
+    ) throws IOException {
+        Map<Path, List<Path>> grouped = relativePaths.stream()
+            .collect(Collectors.groupingBy(p -> p.getNameCount() > 0 ? p.getName(0) : p));
+
+        // Every fabric8 exec/upload call re-waits for the whole pod to report Ready before opening the
+        // connection — see PodOperationsImpl#getURL. That wait is structurally doomed to run to its full
+        // timeout here: the pod can't be Ready while init-files is itself still blocked waiting for the
+        // ready marker file, which is exactly the upload this call is about to perform. The caller already
+        // proved this container is Running via PodService.waitForInitContainerRunning() right before this
+        // call, so skip the redundant, unsatisfiable pod-Ready wait entirely instead of paying it on every
+        // retry attempt.
+        //
+        // Do NOT restore a positive timeout here. This value has already round-tripped once: it was set to
+        // 30s (bf45e73) to stop intermittent "exec endpoint not initialized yet" failures seen even while
+        // the pod was Running. That concern is real, but a pod-Ready wait cannot address it at THIS call
+        // site — the condition it waits on is unsatisfiable until after this very upload, so any positive
+        // value is dead time that expires and proceeds anyway, never protection. Transient exec-endpoint
+        // failures are covered instead by PodService.withRetries (5 attempts, 1s→10s backoff, 60s budget),
+        // which only became effective once each attempt stopped burning the full timeout first.
+        ContainerResource container = podResource
+            .inContainer(INIT_FILES_CONTAINER_NAME)
+            .withReadyWaitTimeout(0);
+
+        for (Map.Entry<Path, List<Path>> entry : grouped.entrySet()) {
+            Path topRelative = entry.getKey();
+            Path topAbsolute = localBaseDir.resolve(topRelative);
+            String containerPath = containerWorkingDir.resolve(topRelative).toString();
+
+            boolean isBulkFallback = false;
+            if (Files.isDirectory(topAbsolute)) {
+                try {
+                    withRetries(
+                        logger, "uploadInputFilesBulk",
+                        () -> container
+                            .dir(containerPath)
+                            .upload(topAbsolute)
+                    );
+                    // A genuine truncation won't self-heal across retries — every attempt re-runs the same
+                    // count check to the same wrong number, burning the full backoff before falling back.
+                    // Retrying here anyway is intentional: it's the only thing that catches the transient
+                    // race where 'find' runs just before the tar extraction is fully visible on the pod.
+                    // Accepted tradeoff — correctness for the race case over shaving a few seconds off a
+                    // failure path that already falls back to a slower per-file re-upload regardless.
+                    withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, containerPath, topAbsolute));
+                    continue;
+                } catch (Exception e) {
+                    logger.info("Bulk upload failed for '{}', falling back to per-file upload. Reason: {}", topRelative, e.getMessage());
+                    isBulkFallback = true;
+                }
+            }
+
+            for (Path relative : entry.getValue()) {
+                Path abs = localBaseDir.resolve(relative);
+                String target = containerWorkingDir.resolve(relative).toString();
+                // A no-op for OSS callers, whose relativePaths always resolve to regular files (the
+                // top-level directory case is already handled by the bulk branch above). EE callers walk
+                // the working dir into a List<Path> that can itself contain directory entries here.
+                boolean isDirectory = Files.isDirectory(abs);
+
+                withRetries(
+                    logger, "uploadInputFiles",
+                    () ->
+                    {
+                        CopyOrReadable toUpload = isDirectory
+                            ? container.dir(target)
+                            : container.file(target);
+
+                        return toUpload.upload(abs);
+                    }
+                );
+
+                // Only cross-check per-file uploads when this is a fallback from a failed bulk-directory
+                // verification. Verifying every standalone top-level inputFile the same way would double
+                // pod round-trips on the common case (many unrelated individual inputFiles), for
+                // comparatively low risk since a single-file fabric8 upload is far less prone to silent
+                // truncation than the tar-based bulk-directory case.
+                if (isBulkFallback) {
+                    if (isDirectory) {
+                        withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, target, abs));
+                    } else {
+                        withVerificationRetries(logger, "verifyFileUpload", () -> verifyFileUpload(container, logger, target, abs));
+                    }
+                }
+            }
+        }
+
+        try {
+            uploadMarker(runContext, podResource, logger, READY_MARKER, INIT_FILES_CONTAINER_NAME);
+        } catch (IOException e) {
+            // The init container exits only when it finds /kestra/ready, so exit code 0 means
+            // the marker arrived even if the exec WebSocket closed before fabric8 got a clean result.
+            Pod current;
+            try {
+                current = podResource.get();
+            } catch (RuntimeException lookupError) {
+                // Status lookup failed too — surface the original upload error, not this one.
+                e.addSuppressed(lookupError);
+                throw e;
+            }
+            boolean initContainerSucceeded = current != null &&
+                current.getStatus() != null &&
+                current.getStatus().getInitContainerStatuses() != null &&
+                current.getStatus().getInitContainerStatuses().stream()
+                    .filter(cs -> INIT_FILES_CONTAINER_NAME.equals(cs.getName()))
+                    .anyMatch(
+                        cs -> cs.getState() != null &&
+                            cs.getState().getTerminated() != null &&
+                            Integer.valueOf(0).equals(cs.getState().getTerminated().getExitCode())
+                    );
+            if (initContainerSucceeded) {
+                logger.debug("uploadMarker exec failed but init container exited with code 0, marker was received");
+            } else {
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * fabric8's directory upload can report success even when the tar transfer was truncated (e.g. a
+     * dependency directory silently missing files), so cross-check the actual file count on the pod.
+     *
+     * Both sides count non-directory entries without following symlinks: tar preserves a symlink as its
+     * own entry (type 'l') rather than dereferencing it, so counting only regular files locally (which
+     * follows symlinks by default) would overcount against the pod-side 'find -type f' and falsely flag
+     * a correct upload as truncated whenever the directory contains symlinks (e.g. a Python venv).
+     *
+     * This is a count-only check: a truncation that drops bytes from a file's content while keeping its
+     * entry (correct count, short file) is not caught here — only the single-file path ({@link
+     * #verifyFileUpload}) compares byte size. Catches the reported #170 symptom (missing files), not partial
+     * per-file corruption.
+     */
+    private static void verifyDirectoryUpload(ContainerResource container, Logger logger, String containerPath, Path localPath) throws IOException {
+        long expectedFileCount;
+        try (Stream<Path> files = Files.walk(localPath)) {
+            expectedFileCount = files.filter(path -> !Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).count();
+        }
+
+        verifyUpload(
+            container, logger, containerPath, expectedFileCount, "file(s)",
+            "find " + shellQuote(containerPath) + " ! -type d -print0 | tr -dc '\\0' | wc -c"
+        );
+    }
+
+    /**
+     * Single-file counterpart of {@link #verifyDirectoryUpload}, comparing the uploaded file's size on
+     * the pod against the local file to catch a partial/corrupt transfer that fabric8 still reports as success.
+     */
+    private static void verifyFileUpload(ContainerResource container, Logger logger, String containerPath, Path localFile) throws IOException {
+        verifyUpload(container, logger, containerPath, Files.size(localFile), "byte(s)", "wc -c < " + shellQuote(containerPath));
+    }
+
+    /**
+     * Single-quotes a value for safe interpolation into a `sh -c` command, escaping any embedded quote.
+     */
+    private static String shellQuote(String value) {
+        return "'" + value.replace("'", "'\\''") + "'";
+    }
+
+    /**
+     * Best-effort: if the sidecar image lacks 'find'/'wc', the check is skipped rather than failing the task.
+     */
+    private static void verifyUpload(ContainerResource container, Logger logger, String containerPath, long expected, String unit, String shellCommand) throws IOException {
+        Optional<Long> actual = execOutput(container, logger, UPLOAD_VERIFICATION_TIMEOUT, "sh", "-c", shellCommand)
+            .map(String::trim)
+            .flatMap(PodService::parseLong);
+
+        if (actual.isEmpty()) {
+            logger.debug("Skipping upload verification for '{}': the file-sidecar image does not support this check, or the verification command timed out", containerPath);
+            return;
+        }
+
+        // Only a shortfall means truncation — a transfer cannot add entries.
+        if (actual.get() < expected) {
+            throw new IOException(
+                "Upload verification failed for '" + containerPath + "': expected " + expected + " " + unit + " but found " +
+                    actual.get() + " in the file-sidecar container — the tar transfer was likely truncated"
+            );
+        }
+    }
+
+    private static Optional<Long> parseLong(String output) {
+        try {
+            return Optional.of(Long.parseLong(output));
+        } catch (NumberFormatException e) {
+            return Optional.empty();
+        }
     }
 
     public static void uploadMarker(RunContext runContext, PodResource podResource, Logger logger, String marker, String container) throws IOException {
