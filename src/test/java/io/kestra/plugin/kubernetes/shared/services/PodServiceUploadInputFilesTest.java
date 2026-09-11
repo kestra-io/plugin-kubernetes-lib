@@ -1,6 +1,7 @@
 package io.kestra.plugin.kubernetes.shared.services;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -44,7 +45,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * EE ({@code Kubernetes} runner) copies so both consumers share a single tested implementation.
  */
 class PodServiceUploadInputFilesTest {
-    private static final Path CONTAINER_WORKING_DIR = Path.of("/kestra/working-dir");
+    private static final String CONTAINER_WORKING_DIR = "/kestra/working-dir";
     private static final String INIT_FILES_CONTAINER_NAME = "init-files";
 
     /**
@@ -72,7 +73,9 @@ class PodServiceUploadInputFilesTest {
         Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
         Mockito.when(container.withReadyWaitTimeout(0)).thenReturn(container);
         Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        // The ready marker still uploads via upload(Path); standalone input files upload via upload(InputStream).
         Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
 
         Files.writeString(localBaseDir.resolve("a.txt"), "AAA");
         Files.writeString(localBaseDir.resolve("b.txt"), "BBB");
@@ -90,8 +93,10 @@ class PodServiceUploadInputFilesTest {
         Mockito.verify(container, Mockito.times(1)).file("/kestra/working-dir/a.txt");
         Mockito.verify(container, Mockito.times(1)).file("/kestra/working-dir/b.txt");
 
-        // 2 input files + the ready marker.
-        Mockito.verify(fileUploader, Mockito.times(3)).upload(Mockito.any(Path.class));
+        // The 2 standalone input files stream via a single cat-style upload(InputStream)...
+        Mockito.verify(fileUploader, Mockito.times(2)).upload(Mockito.any(InputStream.class));
+        // ...while only the ready marker uses the tar-based upload(Path).
+        Mockito.verify(fileUploader, Mockito.times(1)).upload(Mockito.any(Path.class));
     }
 
     @Test
@@ -190,6 +195,8 @@ class PodServiceUploadInputFilesTest {
 
         CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
         Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+        // The ready marker still uploads via upload(Path).
         Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
 
         // Simulate the verification exec: the directory file-count check reports only 1 file (truncated),
@@ -232,8 +239,8 @@ class PodServiceUploadInputFilesTest {
         // ...but verification detected the truncated transfer, so every file was re-uploaded individually.
         Mockito.verify(container, Mockito.times(1)).file("/kestra/working-dir/deps/pkg1.txt");
         Mockito.verify(container, Mockito.times(1)).file("/kestra/working-dir/deps/pkg2.txt");
-        Mockito.verify(fileUploader, Mockito.times(1)).upload(localBaseDir.resolve("deps/pkg1.txt"));
-        Mockito.verify(fileUploader, Mockito.times(1)).upload(localBaseDir.resolve("deps/pkg2.txt"));
+        // Standalone per-file fallback uploads stream via upload(InputStream), not upload(Path).
+        Mockito.verify(fileUploader, Mockito.times(2)).upload(Mockito.any(InputStream.class));
     }
 
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
@@ -288,8 +295,7 @@ class PodServiceUploadInputFilesTest {
         Mockito.verify(container, Mockito.atLeastOnce()).writingOutput(Mockito.any(OutputStream.class));
 
         // ...counts matched, so no per-file fallback upload was needed.
-        Mockito.verify(fileUploader, Mockito.never()).upload(localBaseDir.resolve("deps/pkg1.txt"));
-        Mockito.verify(fileUploader, Mockito.never()).upload(localBaseDir.resolve("deps/pkg2.txt"));
+        Mockito.verify(fileUploader, Mockito.never()).upload(Mockito.any(InputStream.class));
     }
 
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
@@ -369,6 +375,8 @@ class PodServiceUploadInputFilesTest {
 
         CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
         Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+        // The ready marker still uploads via upload(Path).
         Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
 
         Files.createDirectories(localBaseDir.resolve("data"));
@@ -389,11 +397,11 @@ class PodServiceUploadInputFilesTest {
         Mockito.verify(dirUploader, Mockito.times(1)).upload(localBaseDir.resolve("data"));
 
         Mockito.verify(container, Mockito.times(1)).file(Mockito.contains("/kestra/working-dir/config.yaml"));
-        Mockito.verify(fileUploader, Mockito.times(1)).upload(localBaseDir.resolve("config.yaml"));
+        // config.yaml is a standalone top-level file, so it streams via upload(InputStream).
+        Mockito.verify(fileUploader, Mockito.times(1)).upload(Mockito.any(InputStream.class));
 
-        // we verify no individual file uploads
-        Mockito.verify(fileUploader, Mockito.never()).upload(localBaseDir.resolve("data/a.txt"));
-        Mockito.verify(fileUploader, Mockito.never()).upload(localBaseDir.resolve("data/b.txt"));
+        // we verify no individual file uploads for the bulk-uploaded directory contents
+        Mockito.verify(container, Mockito.never()).file(Mockito.contains("/kestra/working-dir/data"));
     }
 
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
@@ -451,7 +459,226 @@ class PodServiceUploadInputFilesTest {
         assertThat("the mismatched verification exec must have been retried", execCallCount.get(), is(2));
 
         // ...so the transient mismatch resolved on retry and no per-file fallback upload was needed.
-        Mockito.verify(fileUploader, Mockito.never()).upload(localBaseDir.resolve("deps/pkg1.txt"));
-        Mockito.verify(fileUploader, Mockito.never()).upload(localBaseDir.resolve("deps/pkg2.txt"));
+        Mockito.verify(fileUploader, Mockito.never()).upload(Mockito.any(InputStream.class));
+    }
+
+    @Test
+    void shouldRejectAbsoluteRelativePath(@TempDir Path localBaseDir) throws Exception {
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        RunContext runContext = runContext(localBaseDir);
+
+        Path absolute = localBaseDir.resolve("a.txt");
+        assertThrows(IllegalArgumentException.class, () ->
+            PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, List.of(absolute))
+        );
+    }
+
+    @Test
+    void shouldRejectPathEscapingBaseDirectory(@TempDir Path localBaseDir) throws Exception {
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        RunContext runContext = runContext(localBaseDir);
+
+        Path escaping = Path.of("../outside.txt");
+        assertThrows(IllegalArgumentException.class, () ->
+            PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, List.of(escaping))
+        );
+    }
+
+    @Timeout(value = 15, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldFailUploadWhenPerFileVerificationDetectsMissingFile(@TempDir Path localBaseDir) throws Exception {
+        // Regression test: a missing pod-side file used to make the wc/if-else check exit non-zero,
+        // which verifyUpload treats the same as "tool unsupported" and silently skips — letting a
+        // truncated per-file fallback upload pass verification. The fixed shell command instead
+        // echoes 0 for a missing file, which must be reported as a real shortfall.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.any(Integer.class))).thenReturn(container);
+
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+
+        // Bulk directory verification under-reports (forcing per-file fallback); the per-file check for
+        // pkg1.txt then reports 0 (missing on the pod), while pkg2.txt reports its correct byte count.
+        Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
+        {
+            OutputStream out = writingOutputInvocation.getArgument(0);
+            TtyExecErrorable errorable = Mockito.mock(TtyExecErrorable.class);
+            Mockito.when(errorable.exec(Mockito.any(String[].class))).thenAnswer(execInvocation ->
+            {
+                Object[] command = execInvocation.getArguments();
+                String shellCommand = (String) command[command.length - 1];
+                String response = shellCommand.contains("find")
+                    ? "1"
+                    : shellCommand.contains("pkg1.txt") ? "0" : "3";
+                out.write(response.getBytes(StandardCharsets.UTF_8));
+
+                ExecWatch watch = Mockito.mock(ExecWatch.class);
+                Mockito.when(watch.exitCode()).thenReturn(CompletableFuture.completedFuture(0));
+                return watch;
+            });
+            return errorable;
+        });
+
+        Files.createDirectories(localBaseDir.resolve("deps"));
+        Files.writeString(localBaseDir.resolve("deps/pkg1.txt"), "AA");
+        Files.writeString(localBaseDir.resolve("deps/pkg2.txt"), "BBB");
+
+        RunContext runContext = runContext(localBaseDir);
+        List<Path> relativePaths = List.of(Path.of("deps/pkg1.txt"), Path.of("deps/pkg2.txt"));
+
+        assertThrows(IOException.class, () ->
+            PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths)
+        );
+    }
+
+    @Timeout(value = 15, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldUploadNestedDirectoryEntryDuringPerFileFallback(@TempDir Path localBaseDir) throws Exception {
+        // The per-file fallback loop can itself encounter a directory entry (EE callers walk the working
+        // dir into a List<Path> that isn't limited to regular files), which must go through container.dir(...)
+        // rather than container.file(...).
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.any(Integer.class))).thenReturn(container);
+
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+        // The ready marker still uploads via upload(Path).
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        // Force the top-level 'deps' bulk verification to fail (triggering fallback); any other
+        // verification exec (the nested 'sub' directory check, or the 'file.txt' size check encountered
+        // during the fallback) reports a value large enough to pass, since this test is only about which
+        // fabric8 DSL call the fallback loop uses for a directory entry, not the verification outcome.
+        Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
+        {
+            OutputStream out = writingOutputInvocation.getArgument(0);
+            TtyExecErrorable errorable = Mockito.mock(TtyExecErrorable.class);
+            Mockito.when(errorable.exec(Mockito.any(String[].class))).thenAnswer(execInvocation ->
+            {
+                Object[] command = execInvocation.getArguments();
+                String shellCommand = (String) command[command.length - 1];
+                String response = shellCommand.contains("'/kestra/working-dir/deps'") ? "0" : "999999";
+                out.write(response.getBytes(StandardCharsets.UTF_8));
+
+                ExecWatch watch = Mockito.mock(ExecWatch.class);
+                Mockito.when(watch.exitCode()).thenReturn(CompletableFuture.completedFuture(0));
+                return watch;
+            });
+            return errorable;
+        });
+
+        Files.createDirectories(localBaseDir.resolve("deps/sub"));
+        Files.writeString(localBaseDir.resolve("deps/sub/nested.txt"), "N");
+        Files.writeString(localBaseDir.resolve("deps/file.txt"), "F");
+
+        RunContext runContext = runContext(localBaseDir);
+        List<Path> relativePaths = List.of(Path.of("deps/sub"), Path.of("deps/file.txt"));
+
+        PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths);
+
+        Mockito.verify(container, Mockito.times(1)).dir("/kestra/working-dir/deps/sub");
+        Mockito.verify(dirUploader, Mockito.times(1)).upload(localBaseDir.resolve("deps/sub"));
+        Mockito.verify(container, Mockito.times(1)).file("/kestra/working-dir/deps/file.txt");
+    }
+
+    @Timeout(value = 15, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldSkipVerificationWhenSidecarLacksTool(@TempDir Path localBaseDir) throws Exception {
+        // When the verification exec exits non-zero (e.g. the sidecar image has no 'find'/'wc'), the
+        // check must be skipped rather than failing — the bulk upload stands with no per-file fallback.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.any(Integer.class))).thenReturn(container);
+
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+        // The ready marker still uploads via upload(Path).
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
+        {
+            TtyExecErrorable errorable = Mockito.mock(TtyExecErrorable.class);
+            Mockito.when(errorable.exec(Mockito.any(String[].class))).thenAnswer(execInvocation ->
+            {
+                ExecWatch watch = Mockito.mock(ExecWatch.class);
+                Mockito.when(watch.exitCode()).thenReturn(CompletableFuture.completedFuture(127));
+                return watch;
+            });
+            return errorable;
+        });
+
+        Files.createDirectories(localBaseDir.resolve("deps"));
+        Files.writeString(localBaseDir.resolve("deps/pkg1.txt"), "AA");
+
+        RunContext runContext = runContext(localBaseDir);
+        List<Path> relativePaths = List.of(Path.of("deps/pkg1.txt"));
+
+        assertDoesNotThrow(() ->
+            PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths)
+        );
+
+        Mockito.verify(dirUploader, Mockito.times(1)).upload(localBaseDir.resolve("deps"));
+        Mockito.verify(container, Mockito.never()).file(Mockito.startsWith("/kestra/working-dir"));
+    }
+
+    @Test
+    void shouldPropagateMarkerErrorWithLookupFailureSuppressed(@TempDir Path localBaseDir) throws Exception {
+        // When the marker upload fails AND the fallback status lookup (podResource.get()) also fails,
+        // the original marker IOException must propagate, with the lookup failure attached as suppressed
+        // rather than replacing it.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(0)).thenReturn(container);
+
+        RuntimeException lookupError = new RuntimeException("api server unreachable");
+        Mockito.when(podResource.get()).thenThrow(lookupError);
+
+        RunContext runContext = runContext(localBaseDir);
+
+        IOException markerError = new IOException("exec WebSocket closed before result");
+        try (var staticMock = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            staticMock.when(
+                () -> PodService.uploadMarker(Mockito.any(), Mockito.any(), Mockito.any(), Mockito.anyString(), Mockito.anyString())
+            ).thenThrow(markerError);
+
+            IOException thrown = assertThrows(IOException.class, () ->
+                PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, List.of())
+            );
+
+            assertThat(thrown, is(markerError));
+            assertThat(thrown.getSuppressed().length, is(1));
+            assertThat(thrown.getSuppressed()[0], is(lookupError));
+        }
     }
 }
