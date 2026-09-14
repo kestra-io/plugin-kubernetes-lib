@@ -578,6 +578,111 @@ class PodServiceUploadInputFilesTest {
         Mockito.verify(dirUploader, Mockito.times(2)).upload(Mockito.any(Path.class));
     }
 
+    @Timeout(value = 15, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldFailUploadWhenEmptyWorkingDirectoryBulkTransferFailsWithNoSiblingGroups(@TempDir Path localBaseDir) throws Exception {
+        // Regression test for the empty-path-only case: when relativePaths is JUST the whole-directory
+        // marker (a genuinely empty working directory, no top-level siblings), the old fallback loop
+        // 'continue'd past the empty-path group's sole entry, so nothing was re-attempted and the method
+        // still proceeded to uploadMarker and reported success for a transfer that actually failed. A
+        // failed whole-directory transfer with no sibling group to fall back to must instead surface as
+        // an IOException, never reach uploadMarker.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.anyInt())).thenReturn(container);
+
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        // fabric8 reports success, but the pod-side verification below always disagrees, so the bulk
+        // attempt is treated as a failed transfer (a transient fault with retries exhausted).
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        // Pod-side count always under-reports, forcing the bulk attempt to exhaust its verification
+        // retries and fail.
+        Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
+        {
+            OutputStream out = writingOutputInvocation.getArgument(0);
+            TtyExecErrorable errorable = Mockito.mock(TtyExecErrorable.class);
+            Mockito.when(errorable.exec(Mockito.any(String[].class))).thenAnswer(execInvocation ->
+            {
+                out.write("0".getBytes(StandardCharsets.UTF_8));
+
+                ExecWatch watch = Mockito.mock(ExecWatch.class);
+                Mockito.when(watch.exitCode()).thenReturn(CompletableFuture.completedFuture(0));
+                return watch;
+            });
+            return errorable;
+        });
+
+        // A single local file gives countLocalFiles() an expected count of 1, so the mocked pod-side
+        // count of 0 above reads as a genuine shortfall rather than a legitimately-empty upload.
+        Files.writeString(localBaseDir.resolve("f.txt"), "X");
+
+        RunContext runContext = runContext(localBaseDir);
+        // Only the whole-directory marker is sent, exactly like EE would for this working directory:
+        // relativeWorkingDirectoryFilesPaths(true) always includes the empty-path entry, and 'f.txt'
+        // here is not sent as its own top-level group, so grouped will have that one entry only.
+        List<Path> relativePaths = List.of(Path.of(""));
+
+        IOException thrown = assertThrows(IOException.class, () ->
+            PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths)
+        );
+        assertThat(thrown.getMessage(), containsString("truncated"));
+
+        // The failure must abort before the marker is ever uploaded — no silent success.
+        Mockito.verify(container, Mockito.never()).file("/kestra/ready");
+    }
+
+    @Timeout(value = 15, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldSucceedWhenEmptyWorkingDirectoryBulkTransferSucceeds(@TempDir Path localBaseDir) throws Exception {
+        // Companion to shouldFailUploadWhenEmptyWorkingDirectoryBulkTransferFailsWithNoSiblingGroups: a
+        // genuinely empty working directory (relativePaths is just the whole-directory marker, and the
+        // local directory itself is empty) whose whole-directory transfer SUCCEEDS must still complete
+        // normally, with no fallback attempted and no error surfaced.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.anyInt())).thenReturn(container);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        // Pod-side count matches the empty local directory (0 files), so verification passes.
+        Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
+        {
+            OutputStream out = writingOutputInvocation.getArgument(0);
+            TtyExecErrorable errorable = Mockito.mock(TtyExecErrorable.class);
+            Mockito.when(errorable.exec(Mockito.any(String[].class))).thenAnswer(execInvocation ->
+            {
+                out.write("0".getBytes(StandardCharsets.UTF_8));
+
+                ExecWatch watch = Mockito.mock(ExecWatch.class);
+                Mockito.when(watch.exitCode()).thenReturn(CompletableFuture.completedFuture(0));
+                return watch;
+            });
+            return errorable;
+        });
+
+        RunContext runContext = runContext(localBaseDir);
+        List<Path> relativePaths = List.of(Path.of(""));
+
+        PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths);
+
+        Mockito.verify(container, Mockito.times(1)).dir(CONTAINER_WORKING_DIR);
+        Mockito.verify(dirUploader, Mockito.times(1)).upload(localBaseDir);
+        // The ready marker still uploads: the upload completed successfully.
+        Mockito.verify(container, Mockito.times(1)).file("/kestra/ready");
+    }
+
     @Test
     void shouldRejectAbsoluteRelativePath(@TempDir Path localBaseDir) throws Exception {
         PodResource podResource = Mockito.mock(PodResource.class);
