@@ -530,6 +530,13 @@ public final class PodService {
      * upload(InputStream)} exec, while a local directory (whether the top-level bulk upload or a
      * directory encountered in the per-file fallback loop) goes through a single tar {@code
      * upload(Path)} exec.
+     * <p>
+     * Each entry in {@code relativePaths} must stay within {@code localBaseDir}: an absolute entry, or
+     * one that escapes the base directory after normalization, is rejected up-front with an {@link
+     * IllegalArgumentException}. This containment check is purely lexical — {@link Path#normalize()}
+     * does not touch the filesystem — so a symlink that lives under {@code localBaseDir} but points
+     * outside it is not detected here and resolves through at open time, exactly as in the two consumer
+     * copies this consolidates.
      *
      * @param runContext the run context, used to resolve the local marker file location for {@link #uploadMarker}
      * @param podResource the pod to upload into
@@ -548,6 +555,15 @@ public final class PodService {
         List<Path> relativePaths
     ) throws IOException {
         var normalizedBaseDir = localBaseDir.normalize();
+        // Normalize each relative path ONCE and use the normalized form for every downstream step —
+        // the containment guard, the grouping key, the local resolve, and the container path — so the
+        // guard can never accept a path the upload then interprets differently. Without this, an entry
+        // like './x' passes the guard (it resolves to 'x') but its raw top segment '.' makes the group
+        // resolve to localBaseDir itself, tarring the ENTIRE base directory instead of the one file.
+        // A bare '.' and the empty path both normalize to the empty path; this is DELIBERATELY kept,
+        // not rejected: EE walks its working directory into this list and always includes an empty
+        // entry that means "upload the whole working directory", and Step C relies on that meaning.
+        var normalizedRelatives = new ArrayList<Path>(relativePaths.size());
         for (Path relative : relativePaths) {
             if (relative.isAbsolute()) {
                 throw new IllegalArgumentException("Input file path '" + relative + "' must be relative to the local base directory, but is absolute");
@@ -556,9 +572,10 @@ public final class PodService {
             if (!resolved.startsWith(normalizedBaseDir)) {
                 throw new IllegalArgumentException("Input file path '" + relative + "' escapes the local base directory '" + localBaseDir + "'");
             }
+            normalizedRelatives.add(relative.normalize());
         }
 
-        var grouped = relativePaths.stream()
+        var grouped = normalizedRelatives.stream()
             .collect(Collectors.groupingBy(p -> p.getNameCount() > 0 ? p.getName(0) : p));
 
         // Every fabric8 exec/upload call re-waits for the whole pod to report Ready before opening the

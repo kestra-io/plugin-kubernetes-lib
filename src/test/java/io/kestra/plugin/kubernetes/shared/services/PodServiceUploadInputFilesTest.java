@@ -486,6 +486,41 @@ class PodServiceUploadInputFilesTest {
         );
     }
 
+    @Test
+    void shouldNormalizeDotSlashPrefixedPathToSingleFile(@TempDir Path localBaseDir) throws Exception {
+        // Regression test: a './x.txt' entry passes the containment guard (it resolves to 'x.txt') but
+        // its raw top segment '.' used to make the group resolve to localBaseDir itself, so the bulk
+        // branch tarred the ENTIRE base directory. Normalizing the entry before grouping means it is
+        // uploaded as the single regular file it names, via upload(InputStream), and the directory tar
+        // branch is never taken.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Logger logger = Mockito.mock(Logger.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(0)).thenReturn(container);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        Files.writeString(localBaseDir.resolve("single.txt"), "AAA");
+
+        RunContext runContext = runContext(localBaseDir);
+        List<Path> relativePaths = List.of(Path.of("./single.txt"));
+
+        PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths);
+
+        // The normalized entry targets the file itself, not the base directory...
+        Mockito.verify(container, Mockito.times(1)).file("/kestra/working-dir/single.txt");
+        Mockito.verify(fileUploader, Mockito.times(1)).upload(Mockito.any(InputStream.class));
+        // ...and the whole-directory tar branch is never taken.
+        Mockito.verify(dirUploader, Mockito.never()).upload(Mockito.any(Path.class));
+    }
+
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
     @Test
     void shouldFailUploadWhenPerFileVerificationDetectsMissingFile(@TempDir Path localBaseDir) throws Exception {
@@ -510,6 +545,7 @@ class PodServiceUploadInputFilesTest {
 
         // Bulk directory verification under-reports (forcing per-file fallback); the per-file check for
         // pkg1.txt then reports 0 (missing on the pod), while pkg2.txt reports its correct byte count.
+        AtomicReference<String> perFileCheckCommand = new AtomicReference<>();
         Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
         {
             OutputStream out = writingOutputInvocation.getArgument(0);
@@ -518,6 +554,9 @@ class PodServiceUploadInputFilesTest {
             {
                 Object[] command = execInvocation.getArguments();
                 String shellCommand = (String) command[command.length - 1];
+                if (shellCommand.contains("pkg1.txt")) {
+                    perFileCheckCommand.set(shellCommand);
+                }
                 String response = shellCommand.contains("find")
                     ? "1"
                     : shellCommand.contains("pkg1.txt") ? "0" : "3";
@@ -540,6 +579,12 @@ class PodServiceUploadInputFilesTest {
         assertThrows(IOException.class, () ->
             PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths)
         );
+
+        // Pin the actual fix, not just its outcome: the mock always exits 0, so the shortfall is only
+        // reported because the command echoes 0 for a missing file. Reverting to the old
+        // `wc -c < missing` form (which relies on a non-zero exit the mock never simulates) would leave
+        // the assertThrows above green — this asserts the if/else form is what runs.
+        assertThat(perFileCheckCommand.get(), containsString("else echo 0"));
     }
 
     @Timeout(value = 15, unit = TimeUnit.MINUTES)
