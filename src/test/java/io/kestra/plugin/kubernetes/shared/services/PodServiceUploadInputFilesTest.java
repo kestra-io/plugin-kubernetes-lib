@@ -465,6 +465,119 @@ class PodServiceUploadInputFilesTest {
         Mockito.verify(fileUploader, Mockito.never()).upload(Mockito.any(InputStream.class));
     }
 
+    @Timeout(value = 15, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldUploadWholeWorkingDirectoryOnceWhenRootEntryPresent(@TempDir Path localBaseDir) throws Exception {
+        // Regression test for #203: EE's relativeWorkingDirectoryFilesPaths(true) returns the empty path
+        // (meaning "upload the whole working directory") ALONGSIDE every top-level entry. Uploading the
+        // empty-path group used to tar the whole directory, then every other top-level group re-sent the
+        // same bytes individually — doubling every EE upload. A single bulk transfer of the whole
+        // directory must now be attempted first, and the other top-level entries must never be uploaded
+        // on top of it when that transfer succeeds.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Logger logger = Mockito.mock(Logger.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.anyInt())).thenReturn(container);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        Files.createDirectories(localBaseDir.resolve("data"));
+        Files.writeString(localBaseDir.resolve("data/a.txt"), "A");
+        Files.writeString(localBaseDir.resolve("data/b.txt"), "B");
+        Files.writeString(localBaseDir.resolve("config.yaml"), "cfg");
+
+        RunContext runContext = runContext(localBaseDir);
+        // Mirrors EE's shape: the empty path (whole working directory) plus every top-level entry it contains.
+        List<Path> relativePaths = List.of(Path.of(""), Path.of("data"), Path.of("config.yaml"));
+
+        PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths);
+
+        // Exactly ONE bulk directory transfer, of the whole working directory...
+        Mockito.verify(container, Mockito.times(1)).dir(Mockito.anyString());
+        Mockito.verify(container, Mockito.times(1)).dir(CONTAINER_WORKING_DIR);
+        Mockito.verify(dirUploader, Mockito.times(1)).upload(localBaseDir);
+
+        // ...and ZERO per-entry uploads: neither 'data' nor 'config.yaml' were re-uploaded individually.
+        Mockito.verify(container, Mockito.never()).dir("/kestra/working-dir/data");
+        Mockito.verify(container, Mockito.never()).file("/kestra/working-dir/config.yaml");
+
+        // The ready marker still uploads.
+        Mockito.verify(container, Mockito.times(1)).file("/kestra/ready");
+        Mockito.verify(fileUploader, Mockito.times(1)).upload(Mockito.any(Path.class));
+    }
+
+    @Timeout(value = 15, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldFallBackToPerTopLevelUploadWhenWholeDirectoryVerificationFails(@TempDir Path localBaseDir) throws Exception {
+        // Companion to shouldUploadWholeWorkingDirectoryOnceWhenRootEntryPresent: when the single
+        // whole-directory bulk transfer fails its verification, the fallback must run today's per-top-level
+        // grouping — not re-attempt the whole directory again (that would be a no-op "recovery").
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.anyInt())).thenReturn(container);
+
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        // The whole-working-directory check under-reports (forcing the fallback); the per-top-level 'data'
+        // directory check that follows during the fallback reports the correct count.
+        Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
+        {
+            OutputStream out = writingOutputInvocation.getArgument(0);
+            TtyExecErrorable errorable = Mockito.mock(TtyExecErrorable.class);
+            Mockito.when(errorable.exec(Mockito.any(String[].class))).thenAnswer(execInvocation ->
+            {
+                Object[] command = execInvocation.getArguments();
+                String shellCommand = (String) command[command.length - 1];
+                String response = shellCommand.contains("'" + CONTAINER_WORKING_DIR + "'") ? "0" : "1";
+                out.write(response.getBytes(StandardCharsets.UTF_8));
+
+                ExecWatch watch = Mockito.mock(ExecWatch.class);
+                Mockito.when(watch.exitCode()).thenReturn(CompletableFuture.completedFuture(0));
+                return watch;
+            });
+            return errorable;
+        });
+
+        Files.createDirectories(localBaseDir.resolve("data"));
+        Files.writeString(localBaseDir.resolve("data/a.txt"), "A");
+        Files.writeString(localBaseDir.resolve("config.yaml"), "cfg");
+
+        RunContext runContext = runContext(localBaseDir);
+        List<Path> relativePaths = List.of(Path.of(""), Path.of("data"), Path.of("config.yaml"));
+
+        PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths);
+
+        // The whole-directory transfer was attempted first and failed verification...
+        Mockito.verify(container, Mockito.times(1)).dir(CONTAINER_WORKING_DIR);
+        Mockito.verify(dirUploader, Mockito.times(1)).upload(localBaseDir);
+
+        // ...so the fallback ran today's per-top-level upload for the OTHER groups — never re-uploading
+        // localBaseDir itself a second time under the empty-path group.
+        Mockito.verify(container, Mockito.times(1)).dir("/kestra/working-dir/data");
+        Mockito.verify(dirUploader, Mockito.times(1)).upload(localBaseDir.resolve("data"));
+        Mockito.verify(container, Mockito.times(1)).file("/kestra/working-dir/config.yaml");
+        Mockito.verify(fileUploader, Mockito.times(1)).upload(Mockito.any(InputStream.class));
+
+        // Only 2 bulk directory transfers total: the failed whole-directory attempt and the 'data' fallback.
+        Mockito.verify(dirUploader, Mockito.times(2)).upload(Mockito.any(Path.class));
+    }
+
     @Test
     void shouldRejectAbsoluteRelativePath(@TempDir Path localBaseDir) throws Exception {
         PodResource podResource = Mockito.mock(PodResource.class);
