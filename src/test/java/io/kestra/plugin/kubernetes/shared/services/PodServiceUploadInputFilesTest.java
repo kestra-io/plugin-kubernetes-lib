@@ -8,6 +8,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -35,8 +36,10 @@ import io.fabric8.kubernetes.client.dsl.TtyExecErrorable;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -487,6 +490,47 @@ class PodServiceUploadInputFilesTest {
     }
 
     @Test
+    void shouldNotEscapeBaseDirViaReentrantNormalization(@TempDir Path localBaseDir) throws Exception {
+        // Regression test: '..' can survive an anchor-free Path.normalize() even though the anchored
+        // resolve() against localBaseDir absorbs it back in bounds. With localBaseDir's own leaf name as
+        // 'baseDirName', 'b/../../<baseDirName>/legit.txt' resolves (anchored, starting from
+        // localBaseDir) to localBaseDir/legit.txt — in bounds, so the containment guard PASSES — but
+        // normalizes in isolation (no anchor) to '../<baseDirName>/legit.txt', whose top segment is '..'.
+        // Storing that isolated-normalize form (the pre-fix bug) would group this entry under '..', and
+        // the bulk branch would then tar the PARENT of localBaseDir instead of the single legit file.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Logger logger = Mockito.mock(Logger.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(0)).thenReturn(container);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        Files.writeString(localBaseDir.resolve("legit.txt"), "AAA");
+
+        RunContext runContext = runContext(localBaseDir);
+        String baseDirName = localBaseDir.getFileName().toString();
+        Path reentrant = Path.of("b", "..", "..", baseDirName, "legit.txt");
+
+        assertDoesNotThrow(() ->
+            PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, List.of(reentrant))
+        );
+
+        // The entry resolves/uploads as the single legit file under localBaseDir...
+        Mockito.verify(container, Mockito.times(1)).file("/kestra/working-dir/legit.txt");
+        Mockito.verify(fileUploader, Mockito.times(1)).upload(Mockito.any(InputStream.class));
+        // ...never as a bulk directory tar of the PARENT of localBaseDir (the pre-fix vulnerable shape,
+        // which grouped this entry under the raw '..' top segment).
+        Mockito.verify(container, Mockito.never()).dir(Mockito.anyString());
+    }
+
+    @Test
     void shouldNormalizeDotSlashPrefixedPathToSingleFile(@TempDir Path localBaseDir) throws Exception {
         // Regression test: a './x.txt' entry passes the containment guard (it resolves to 'x.txt') but
         // its raw top segment '.' used to make the group resolve to localBaseDir itself, so the bulk
@@ -581,10 +625,136 @@ class PodServiceUploadInputFilesTest {
         );
 
         // Pin the actual fix, not just its outcome: the mock always exits 0, so the shortfall is only
-        // reported because the command echoes 0 for a missing file. Reverting to the old
-        // `wc -c < missing` form (which relies on a non-zero exit the mock never simulates) would leave
-        // the assertThrows above green — this asserts the if/else form is what runs.
-        assertThat(perFileCheckCommand.get(), containsString("else echo 0"));
+        // reported because the command echoes a negative sentinel for a missing file. Reverting to the
+        // old `wc -c < missing` form (which relies on a non-zero exit the mock never simulates) would
+        // leave the assertThrows above green — this asserts the if/else form is what runs.
+        assertThat(perFileCheckCommand.get(), containsString("else echo -1"));
+    }
+
+    @Timeout(value = 15, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldFailUploadWhenPerFileVerificationDetectsMissingZeroByteFile(@TempDir Path localBaseDir) throws Exception {
+        // Regression test: a missing pod-side file whose LOCAL counterpart is zero bytes used to pass
+        // verification silently, because 'expected' (Files.size of the zero-byte local file) was 0 and
+        // 'actual < expected' (0 < 0) is false — a missing file was indistinguishable from a present,
+        // empty one. The fixed shell command reports a negative sentinel for a missing file, which is
+        // always below any real expected byte count, including 0.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.any(Integer.class))).thenReturn(container);
+
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+
+        // Bulk directory verification under-reports (forcing per-file fallback); the per-file check for
+        // the zero-byte pkg1.txt then reports the missing-file sentinel, while pkg2.txt reports its
+        // correct byte count.
+        Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
+        {
+            OutputStream out = writingOutputInvocation.getArgument(0);
+            TtyExecErrorable errorable = Mockito.mock(TtyExecErrorable.class);
+            Mockito.when(errorable.exec(Mockito.any(String[].class))).thenAnswer(execInvocation ->
+            {
+                Object[] command = execInvocation.getArguments();
+                String shellCommand = (String) command[command.length - 1];
+                String response = shellCommand.contains("find")
+                    ? "1"
+                    : shellCommand.contains("pkg1.txt") ? "-1" : "3";
+                out.write(response.getBytes(StandardCharsets.UTF_8));
+
+                ExecWatch watch = Mockito.mock(ExecWatch.class);
+                Mockito.when(watch.exitCode()).thenReturn(CompletableFuture.completedFuture(0));
+                return watch;
+            });
+            return errorable;
+        });
+
+        Files.createDirectories(localBaseDir.resolve("deps"));
+        Files.writeString(localBaseDir.resolve("deps/pkg1.txt"), "");
+        Files.writeString(localBaseDir.resolve("deps/pkg2.txt"), "BBB");
+
+        RunContext runContext = runContext(localBaseDir);
+        List<Path> relativePaths = List.of(Path.of("deps/pkg1.txt"), Path.of("deps/pkg2.txt"));
+
+        assertThrows(IOException.class, () ->
+            PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths)
+        );
+    }
+
+    @Timeout(value = 1, unit = TimeUnit.MINUTES)
+    @Test
+    void shouldAbortUploadWhenVerificationIsInterrupted(@TempDir Path localBaseDir) throws Exception {
+        // Regression test: execOutput's InterruptedException handling used to return Optional.empty(),
+        // the same shape verifyUpload treats as "sidecar lacks find/wc" and silently skips — so a task
+        // cancellation mid-verification was swallowed and the bulk-upload loop fell through to the
+        // per-file fallback instead of aborting. The verification exec must instead surface the
+        // interruption so uploadInputFiles aborts immediately.
+        PodResource podResource = Mockito.mock(PodResource.class);
+        Logger logger = Mockito.mock(Logger.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(Mockito.any(Integer.class))).thenReturn(container);
+
+        CopyOrReadable dirUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.dir(Mockito.anyString())).thenReturn(dirUploader);
+        Mockito.when(dirUploader.upload(Mockito.any(Path.class))).thenReturn(true);
+
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(InputStream.class))).thenReturn(true);
+
+        // The verification exec's exitCode future never completes, so the worker thread blocks inside
+        // it until interrupted below — simulating a task cancellation arriving mid-verification.
+        CountDownLatch execStarted = new CountDownLatch(1);
+        CompletableFuture<Integer> neverCompletes = new CompletableFuture<>();
+        Mockito.when(container.writingOutput(Mockito.any(OutputStream.class))).thenAnswer(writingOutputInvocation ->
+        {
+            TtyExecErrorable errorable = Mockito.mock(TtyExecErrorable.class);
+            Mockito.when(errorable.exec(Mockito.any(String[].class))).thenAnswer(execInvocation ->
+            {
+                ExecWatch watch = Mockito.mock(ExecWatch.class);
+                Mockito.when(watch.exitCode()).thenReturn(neverCompletes);
+                execStarted.countDown();
+                return watch;
+            });
+            return errorable;
+        });
+
+        Files.createDirectories(localBaseDir.resolve("deps"));
+        Files.writeString(localBaseDir.resolve("deps/pkg1.txt"), "AA");
+
+        RunContext runContext = runContext(localBaseDir);
+        List<Path> relativePaths = List.of(Path.of("deps/pkg1.txt"));
+
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread worker = new Thread(() ->
+        {
+            try {
+                PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, relativePaths);
+            } catch (Throwable t) {
+                thrown.set(t);
+            }
+        });
+        worker.start();
+
+        assertThat("the verification exec must have started", execStarted.await(10, TimeUnit.SECONDS), is(true));
+        worker.interrupt();
+        worker.join(TimeUnit.SECONDS.toMillis(10));
+
+        assertThat("the upload must abort instead of hanging or falling back", worker.isAlive(), is(false));
+        assertThat(thrown.get(), notNullValue());
+        assertThat(thrown.get(), instanceOf(IOException.class));
+        // Aborted, not silently treated as a skipped check that falls through to the per-file fallback.
+        Mockito.verify(container, Mockito.never()).file(Mockito.anyString());
     }
 
     @Timeout(value = 15, unit = TimeUnit.MINUTES)

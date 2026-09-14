@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -450,8 +451,14 @@ public final class PodService {
             }
             return Optional.of(output.toString(StandardCharsets.UTF_8));
         } catch (InterruptedException e) {
+            // Restore the flag so the caller can observe the cancellation, and fail loudly instead of
+            // returning Optional.empty(): that's the same shape as "sidecar lacks find/wc" below, which
+            // verifyUpload treats as a skipped-not-failed check — silently letting a cancelled task's
+            // verification loop carry on to the next file group instead of aborting.
             Thread.currentThread().interrupt();
-            return Optional.empty();
+            throw new UncheckedIOException(new IOException(
+                "Verification command '" + String.join(" ", command) + "' was interrupted", e
+            ));
         } catch (TimeoutException e) {
             // Best-effort: a timeout here is otherwise indistinguishable from "verification passed", so
             // log it explicitly rather than silently skipping the check like the generic catch below.
@@ -572,7 +579,12 @@ public final class PodService {
             if (!resolved.startsWith(normalizedBaseDir)) {
                 throw new IllegalArgumentException("Input file path '" + relative + "' escapes the local base directory '" + localBaseDir + "'");
             }
-            normalizedRelatives.add(relative.normalize());
+            // Derived from the already-validated 'resolved', not from re-normalizing 'relative' in
+            // isolation: an anchor-free normalize() can leave a '..' that the anchored resolve() above
+            // absorbed (e.g. 'b/../../<baseDirName>/legit.txt' resolves back in bounds but normalizes in
+            // isolation to '../<baseDirName>/legit.txt'), which would make the guard validate one path
+            // while grouping/uploading a different one that escapes localBaseDir.
+            normalizedRelatives.add(normalizedBaseDir.relativize(resolved));
         }
 
         var grouped = normalizedRelatives.stream()
@@ -617,10 +629,16 @@ public final class PodService {
                     // race where 'find' runs just before the tar extraction is fully visible on the pod.
                     // Accepted tradeoff — correctness for the race case over shaving a few seconds off a
                     // failure path that already falls back to a slower per-file re-upload regardless.
-                    withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, topContainerPath, topAbsolute));
+                    // The local count is walked once, outside the retry: it's the pod-side count that's
+                    // racy, not the local filesystem, so re-walking it on every retry attempt is wasted work.
+                    var expectedFileCount = countLocalFiles(topAbsolute);
+                    withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, topContainerPath, expectedFileCount));
                     continue;
                 } catch (Exception e) {
-                    logger.info("Bulk upload failed for '{}', falling back to per-file upload. Reason: {}", topRelative, e.getMessage());
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new IOException("Upload verification for '" + topRelative + "' was interrupted", e);
+                    }
+                    logger.info("Bulk upload failed for '{}', falling back to per-file upload. Reason: {}", topRelative, e.getMessage(), e);
                     isBulkFallback = true;
                 }
             }
@@ -657,7 +675,8 @@ public final class PodService {
                 // truncation than the tar-based bulk-directory case.
                 if (isBulkFallback) {
                     if (isDirectory) {
-                        withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, target, abs));
+                        var expectedFileCount = countLocalFiles(abs);
+                        withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, target, expectedFileCount));
                     } else {
                         withVerificationRetries(logger, "verifyFileUpload", () -> verifyFileUpload(container, logger, target, abs));
                     }
@@ -727,17 +746,26 @@ public final class PodService {
      * entry (correct count, short file) is not caught here — only the single-file path ({@link
      * #verifyFileUpload}) compares byte size. Catches the reported #170 symptom (missing files), not partial
      * per-file corruption.
+     *
+     * @param expectedFileCount the local file count, pre-computed by {@link #countLocalFiles} once outside
+     *                          any retry loop — the local filesystem can't change between retry attempts,
+     *                          only the pod-side count is racy, so re-walking it on every attempt is wasted work.
      */
-    private static void verifyDirectoryUpload(ContainerResource container, Logger logger, String containerPath, Path localPath) throws IOException {
-        long expectedFileCount;
-        try (var files = Files.walk(localPath)) {
-            expectedFileCount = files.filter(path -> !Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).count();
-        }
-
+    private static void verifyDirectoryUpload(ContainerResource container, Logger logger, String containerPath, long expectedFileCount) throws IOException {
         verifyUpload(
             container, logger, containerPath, expectedFileCount, "file(s)",
             "find " + shellQuote(containerPath) + " ! -type d -print0 | tr -dc '\\0' | wc -c"
         );
+    }
+
+    /**
+     * Counts the non-directory entries under {@code localPath} without following symlinks — see {@link
+     * #verifyDirectoryUpload} for why symlinks are counted as their own entry rather than dereferenced.
+     */
+    private static long countLocalFiles(Path localPath) throws IOException {
+        try (var files = Files.walk(localPath)) {
+            return files.filter(path -> !Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).count();
+        }
     }
 
     /**
@@ -747,14 +775,20 @@ public final class PodService {
      * Uses an explicit if/else rather than {@code test -e ... && wc -c ... || echo 0}: with the latter, a
      * missing 'wc' (tool absent, file present) would make the {@code &&} short-circuit fall through to the
      * {@code ||} branch and report 0, indistinguishable from a genuinely missing file. The if/else form keeps
-     * those two cases separate — a missing file yields {@code echo 0} (a real, verifiable shortfall), while a
-     * missing 'wc' still makes the whole command exit non-zero (check skipped, as before).
+     * those two cases separate — a missing 'wc' still makes the whole command exit non-zero (check skipped,
+     * as before).
+     * <p>
+     * The missing-file branch reports {@code -1}, not {@code 0}: a genuinely present but empty local file
+     * has an expected byte count of 0, and {@code actual < expected} with both sides 0 would never flag a
+     * missing pod-side file as a shortfall. A negative sentinel is always below any real expected byte
+     * count (including 0), so it reliably fails the comparison while a present empty file (which reports
+     * 0 via {@code wc -c}) still passes.
      */
     private static void verifyFileUpload(ContainerResource container, Logger logger, String containerPath, Path localFile) throws IOException {
         var quotedPath = shellQuote(containerPath);
         verifyUpload(
             container, logger, containerPath, Files.size(localFile), "byte(s)",
-            "if [ -e " + quotedPath + " ]; then wc -c < " + quotedPath + "; else echo 0; fi"
+            "if [ -e " + quotedPath + " ]; then wc -c < " + quotedPath + "; else echo -1; fi"
         );
     }
 
@@ -778,7 +812,13 @@ public final class PodService {
             return;
         }
 
-        // Only a shortfall means truncation — a transfer cannot add entries.
+        // Only a shortfall means truncation — a transfer cannot add entries. A negative actual is the
+        // missing-file sentinel from verifyFileUpload's else branch (see its Javadoc), not a real count.
+        if (actual.get() < 0) {
+            throw new IOException(
+                "Upload verification failed for '" + containerPath + "': the file is missing in the file-sidecar container"
+            );
+        }
         if (actual.get() < expected) {
             throw new IOException(
                 "Upload verification failed for '" + containerPath + "': expected at least " + expected + " " + unit + " but found " +
