@@ -621,7 +621,7 @@ public final class PodService {
         // directory is sent twice. Only fall back to the per-top-level-group loop below if that single
         // transfer fails its verification.
         var wholeDirectoryUploaded = grouped.containsKey(EMPTY_RELATIVE_PATH)
-            && uploadWholeWorkingDirectory(container, logger, normalizedBaseDir, containerWorkingDir);
+            && tryBulkUploadDirectory(container, logger, normalizedBaseDir, containerWorkingDir, "the whole working directory");
 
         if (!wholeDirectoryUploaded) {
             for (var entry : grouped.entrySet()) {
@@ -668,33 +668,47 @@ public final class PodService {
     }
 
     /**
-     * Bulk-uploads {@code normalizedBaseDir} in its entirety to {@code containerWorkingDir}, verifying the
-     * transfer exactly once, instead of the per-top-level-group loop in {@link #uploadGroup}.
+     * Bulk-uploads {@code localDir} to {@code containerPath} as a single tar transfer, verifying the
+     * transferred file count once. Shared by the single whole-working-directory transfer in
+     * {@link #uploadInputFiles} and each per-top-level directory group's bulk attempt in
+     * {@link #uploadGroup} — only the retry-exhaustion/interrupt handling differs by caller, everything
+     * else about a "tar a local directory, then cross-check the pod-side count" transfer is identical.
      *
-     * @return true if the whole-directory transfer and its verification succeeded; false if it failed and
-     *         the caller should fall back to the per-top-level-group loop instead.
+     * @param label describes {@code localDir} in log/exception messages (e.g. {@code "the whole working
+     *              directory"} or {@code "'data'"})
+     * @return true if the transfer and its verification succeeded; false if it failed and the caller
+     *         should fall back to a slower upload strategy instead.
      */
-    private static boolean uploadWholeWorkingDirectory(
+    private static boolean tryBulkUploadDirectory(
         ContainerResource container,
         Logger logger,
-        Path normalizedBaseDir,
-        String containerWorkingDir
+        Path localDir,
+        String containerPath,
+        String label
     ) throws IOException {
         try {
             withRetries(
                 logger, "uploadInputFilesBulk",
                 () -> container
-                    .dir(containerWorkingDir)
-                    .upload(normalizedBaseDir)
+                    .dir(containerPath)
+                    .upload(localDir)
             );
-            var expectedFileCount = countLocalFiles(normalizedBaseDir);
-            withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, containerWorkingDir, expectedFileCount));
+            // A genuine truncation won't self-heal across retries — every attempt re-runs the same
+            // count check to the same wrong number, burning the full backoff before falling back.
+            // Retrying here anyway is intentional: it's the only thing that catches the transient
+            // race where 'find' runs just before the tar extraction is fully visible on the pod.
+            // Accepted tradeoff — correctness for the race case over shaving a few seconds off a
+            // failure path that already falls back to a slower re-upload regardless.
+            // The local count is walked once, outside the retry: it's the pod-side count that's
+            // racy, not the local filesystem, so re-walking it on every retry attempt is wasted work.
+            var expectedFileCount = countLocalFiles(localDir);
+            withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, containerPath, expectedFileCount));
             return true;
         } catch (Exception e) {
             if (Thread.currentThread().isInterrupted()) {
-                throw new IOException("Upload verification for the whole working directory was interrupted", e);
+                throw new IOException("Upload verification for " + label + " was interrupted", e);
             }
-            logger.info("Bulk upload of the whole working directory failed, falling back to per-top-level-entry upload. Reason: {}", e.getMessage(), e);
+            logger.info("Bulk upload failed for {}, falling back to a slower upload. Reason: {}", label, e.getMessage(), e);
             return false;
         }
     }
@@ -717,31 +731,10 @@ public final class PodService {
 
         var isBulkFallback = false;
         if (Files.isDirectory(topAbsolute)) {
-            try {
-                withRetries(
-                    logger, "uploadInputFilesBulk",
-                    () -> container
-                        .dir(topContainerPath)
-                        .upload(topAbsolute)
-                );
-                // A genuine truncation won't self-heal across retries — every attempt re-runs the same
-                // count check to the same wrong number, burning the full backoff before falling back.
-                // Retrying here anyway is intentional: it's the only thing that catches the transient
-                // race where 'find' runs just before the tar extraction is fully visible on the pod.
-                // Accepted tradeoff — correctness for the race case over shaving a few seconds off a
-                // failure path that already falls back to a slower per-file re-upload regardless.
-                // The local count is walked once, outside the retry: it's the pod-side count that's
-                // racy, not the local filesystem, so re-walking it on every retry attempt is wasted work.
-                var expectedFileCount = countLocalFiles(topAbsolute);
-                withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, topContainerPath, expectedFileCount));
+            if (tryBulkUploadDirectory(container, logger, topAbsolute, topContainerPath, "'" + topRelative + "'")) {
                 return;
-            } catch (Exception e) {
-                if (Thread.currentThread().isInterrupted()) {
-                    throw new IOException("Upload verification for '" + topRelative + "' was interrupted", e);
-                }
-                logger.info("Bulk upload failed for '{}', falling back to per-file upload. Reason: {}", topRelative, e.getMessage(), e);
-                isBulkFallback = true;
             }
+            isBulkFallback = true;
         }
 
         for (var relative : values) {
