@@ -533,9 +533,20 @@ public final class PodService {
      * by their top-level path segment, one group per sibling — are used ONLY as the fallback if that
      * single transfer fails verification: each sibling group is then re-uploaded on its own, while the
      * empty-path group itself is skipped (re-attempting it would just repeat the failed transfer). If
-     * the empty-path group is the ONLY group present — a genuinely empty working directory with no
-     * sibling entries to fall back to — a failed whole-directory transfer is surfaced as an {@link
-     * IOException} instead of silently skipping the (only) fallback candidate and reporting success.
+     * the empty-path group is the ONLY group present, {@code relativePaths} was just the whole-directory
+     * marker with no sibling top-level groups to fall back to — NOT necessarily a directory that is
+     * empty on disk. In fact this is the DEFAULT shape for an EE run with no inputFiles, no
+     * namespaceFiles, and the deprecated outputDirectory property left at its default (false):
+     * {@code TaskCommands.relativeWorkingDirectoryFilesPaths(true)} always creates {@code
+     * CommandsWrapper.getOutputDirectory()} lazily, then filters that directory back out of the walk,
+     * so {@code [""]}-alone is what a working directory with only that filtered-out entry produces.
+     * Verification still passes trivially in that shape, since both the local and pod-side counts only
+     * count non-directory entries. Whatever the actual on-disk shape, a failed whole-directory transfer
+     * with no sibling group to fall back to is surfaced as an {@link IOException} instead of silently
+     * skipping the (only) fallback candidate and reporting success — trading away main's two full retry
+     * rounds for one: main's fallback loop had no {@code continue} for the empty-path group, so it
+     * re-uploaded and re-verified the same empty path before throwing the same truncated IOException;
+     * this version throws directly on the first failure instead of repeating that doomed retry round.
      * OSS callers never send the empty-path marker, so for them every entry is a normal top-level
      * group from the start.
      * <p>
@@ -588,6 +599,12 @@ public final class PodService {
         // retained purely as the fallback set if that single whole-directory transfer fails verification
         // (see the grouping below) — without this, every top-level entry was re-sent individually on top
         // of the whole-directory transfer, doubling the bytes uploaded on every EE run.
+        // Because '.' normalizes to the same empty path, a bare '.' entry takes this exact same
+        // whole-working-directory path and the same grouped.size() == 1 throw below as an explicit empty
+        // entry would. Neither current caller actually produces a bare '.': OSS fails earlier, in
+        // PluginUtilsService.createInputFiles, on any path outside the working directory before this
+        // method ever sees it, and EE only ever emits already-relativized paths. This is documented here
+        // purely as an equivalence, not a bug.
         var normalizedRelatives = new ArrayList<Path>(relativePaths.size());
         for (Path relative : relativePaths) {
             if (relative.isAbsolute()) {
@@ -632,6 +649,11 @@ public final class PodService {
         // uploading every top-level entry individually on top of it — otherwise every byte in the working
         // directory is sent twice. Only fall back to the per-top-level-group loop below if that single
         // transfer fails its verification.
+        // containerWorkingDir is passed VERBATIM here, not through containerPath(containerWorkingDir,
+        // EMPTY_RELATIVE_PATH) — iterating an empty Path yields one empty segment, so that helper would
+        // append a trailing '/'. This is deliberate, not an oversight: a base path with no trailing slash
+        // is equivalent for both 'tar -C' and 'find' (the two shell tools this value ever reaches), and
+        // it matches what EE's own copy of this transfer passes.
         var wholeDirectoryUpload = grouped.containsKey(EMPTY_RELATIVE_PATH)
             ? tryBulkUploadDirectory(container, logger, normalizedBaseDir, containerWorkingDir, "the whole working directory")
             : null;
@@ -655,7 +677,7 @@ public final class PodService {
                 if (entry.getKey().equals(EMPTY_RELATIVE_PATH)) {
                     continue;
                 }
-                uploadGroup(container, localBaseDir, containerWorkingDir, entry.getKey(), entry.getValue(), logger);
+                uploadGroup(container, normalizedBaseDir, containerWorkingDir, entry.getKey(), entry.getValue(), logger);
             }
         }
 
