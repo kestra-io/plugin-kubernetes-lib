@@ -50,6 +50,9 @@ public final class PodService {
     private static final List<String> COMPLETED_PHASES = List.of(PodPhase.SUCCEEDED.value(), PodPhase.FAILED.value(), PodPhase.UNKNOWN.value()); // see https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-phase
     private static final String SIDECAR_FILES_CONTAINER_NAME = "out-files";
 
+    // EE's marker for "upload the whole working directory" in uploadInputFiles — see its Javadoc.
+    private static final Path EMPTY_RELATIVE_PATH = Path.of("");
+
     // Default exec WebSocket timeout in fabric8 is 10s, which is too short for pods with security contexts
     private static final int REQUEST_TIMEOUT_MS = 30_000;
 
@@ -524,19 +527,42 @@ public final class PodService {
      * Uploads a task's input files into the init-files container so they are available in the main
      * container's working directory before it starts.
      * <p>
-     * Entries are grouped by their top-level path segment. Whenever that top-level entry is a local
-     * directory, it is uploaded in a single tar transfer rather than one file at a time — exec/copy
-     * round-trips to the pod are the dominant cost for large directories (e.g. a Python virtualenv or
-     * node_modules), and tar preserves symlinks as their own entry instead of dereferencing them.
-     * fabric8's tar-based directory upload can report success even when the transfer was silently
-     * truncated on a slow or contended cluster, so every bulk upload is cross-checked against the
-     * pod-side file count ({@link #verifyDirectoryUpload}) and falls back to a slower, individually
-     * verified per-file (or per-directory) upload when the counts disagree.
+     * An empty-path entry in {@code relativePaths} is EE's marker for "upload the whole working
+     * directory in a single tar transfer" (see {@link #EMPTY_RELATIVE_PATH}); when present, that
+     * whole-directory transfer is tried FIRST, before anything else. The remaining entries — grouped
+     * by their top-level path segment, one group per sibling — are used ONLY as the fallback if that
+     * single transfer fails verification: each sibling group is then re-uploaded on its own, while the
+     * empty-path group itself is skipped (re-attempting it would just repeat the failed transfer). If
+     * the empty-path group is the ONLY group present, {@code relativePaths} was just the whole-directory
+     * marker with no sibling top-level groups to fall back to — NOT necessarily a directory that is
+     * empty on disk. In fact this is the DEFAULT shape for an EE run with no inputFiles, no
+     * namespaceFiles, and the deprecated outputDirectory property left at its default (false):
+     * {@code TaskCommands.relativeWorkingDirectoryFilesPaths(true)} always creates {@code
+     * CommandsWrapper.getOutputDirectory()} lazily, then filters that directory back out of the walk,
+     * so {@code [""]}-alone is what a working directory with only that filtered-out entry produces.
+     * Verification still passes trivially in that shape, since both the local and pod-side counts only
+     * count non-directory entries. Whatever the actual on-disk shape, a failed whole-directory transfer
+     * with no sibling group to fall back to is surfaced as an {@link IOException} instead of silently
+     * skipping the (only) fallback candidate and reporting success — trading away main's two full retry
+     * rounds for one: main's fallback loop had no {@code continue} for the empty-path group, so it
+     * re-uploaded and re-verified the same empty path before throwing the same truncated IOException;
+     * this version throws directly on the first failure instead of repeating that doomed retry round.
+     * OSS callers never send the empty-path marker, so for them every entry is a normal top-level
+     * group from the start.
+     * <p>
+     * Whenever a top-level group is a local directory, it is uploaded in a single tar transfer rather
+     * than one file at a time — exec/copy round-trips to the pod are the dominant cost for large
+     * directories (e.g. a Python virtualenv or node_modules), and tar preserves symlinks as their own
+     * entry instead of dereferencing them. fabric8's tar-based directory upload can report success even
+     * when the transfer was silently truncated on a slow or contended cluster, so every bulk upload
+     * (the whole-directory one and each top-level group's) is cross-checked against the pod-side file
+     * count ({@link #verifyDirectoryUpload}) and falls back to a slower, individually verified per-file
+     * (or per-directory) upload when the counts disagree.
      * <p>
      * Transport differs by shape: a standalone regular file streams via a single cat-style {@code
-     * upload(InputStream)} exec, while a local directory (whether the top-level bulk upload or a
-     * directory encountered in the per-file fallback loop) goes through a single tar {@code
-     * upload(Path)} exec.
+     * upload(InputStream)} exec, while a local directory (whether the whole-directory bulk upload, a
+     * top-level group, or a directory encountered in the per-file fallback loop) goes through a single
+     * tar {@code upload(Path)} exec.
      * <p>
      * Each entry in {@code relativePaths} must stay within {@code localBaseDir}: an absolute entry, or
      * one that escapes the base directory after normalization, is rejected up-front with an {@link
@@ -569,7 +595,16 @@ public final class PodService {
         // resolve to localBaseDir itself, tarring the ENTIRE base directory instead of the one file.
         // A bare '.' and the empty path both normalize to the empty path; this is DELIBERATELY kept,
         // not rejected: EE walks its working directory into this list and always includes an empty
-        // entry that means "upload the whole working directory", and Step C relies on that meaning.
+        // entry that means "upload the whole working directory AND NOTHING ELSE". The other entries are
+        // retained purely as the fallback set if that single whole-directory transfer fails verification
+        // (see the grouping below) — without this, every top-level entry was re-sent individually on top
+        // of the whole-directory transfer, doubling the bytes uploaded on every EE run.
+        // Because '.' normalizes to the same empty path, a bare '.' entry takes this exact same
+        // whole-working-directory path and the same grouped.size() == 1 throw below as an explicit empty
+        // entry would. Neither current caller actually produces a bare '.': OSS fails earlier, in
+        // PluginUtilsService.createInputFiles, on any path outside the working directory before this
+        // method ever sees it, and EE only ever emits already-relativized paths. This is documented here
+        // purely as an equivalence, not a bug.
         var normalizedRelatives = new ArrayList<Path>(relativePaths.size());
         for (Path relative : relativePaths) {
             if (relative.isAbsolute()) {
@@ -609,78 +644,40 @@ public final class PodService {
             .inContainer(INIT_FILES_CONTAINER_NAME)
             .withReadyWaitTimeout(0);
 
-        for (var entry : grouped.entrySet()) {
-            var topRelative = entry.getKey();
-            var topAbsolute = localBaseDir.resolve(topRelative);
-            var topContainerPath = containerPath(containerWorkingDir, topRelative);
+        // The empty path is EE's "upload the whole working directory" marker (see the comment above
+        // normalizedRelatives). When present, try it as a single bulk transfer instead of grouping and
+        // uploading every top-level entry individually on top of it — otherwise every byte in the working
+        // directory is sent twice. Only fall back to the per-top-level-group loop below if that single
+        // transfer fails its verification.
+        // containerWorkingDir is passed VERBATIM here, not through containerPath(containerWorkingDir,
+        // EMPTY_RELATIVE_PATH) — iterating an empty Path yields one empty segment, so that helper would
+        // append a trailing '/'. This is deliberate, not an oversight: a base path with no trailing slash
+        // is equivalent for both 'tar -C' and 'find' (the two shell tools this value ever reaches), and
+        // it matches what EE's own copy of this transfer passes.
+        var wholeDirectoryUpload = grouped.containsKey(EMPTY_RELATIVE_PATH)
+            ? tryBulkUploadDirectory(container, logger, normalizedBaseDir, containerWorkingDir, "the whole working directory")
+            : null;
 
-            var isBulkFallback = false;
-            if (Files.isDirectory(topAbsolute)) {
-                try {
-                    withRetries(
-                        logger, "uploadInputFilesBulk",
-                        () -> container
-                            .dir(topContainerPath)
-                            .upload(topAbsolute)
-                    );
-                    // A genuine truncation won't self-heal across retries — every attempt re-runs the same
-                    // count check to the same wrong number, burning the full backoff before falling back.
-                    // Retrying here anyway is intentional: it's the only thing that catches the transient
-                    // race where 'find' runs just before the tar extraction is fully visible on the pod.
-                    // Accepted tradeoff — correctness for the race case over shaving a few seconds off a
-                    // failure path that already falls back to a slower per-file re-upload regardless.
-                    // The local count is walked once, outside the retry: it's the pod-side count that's
-                    // racy, not the local filesystem, so re-walking it on every retry attempt is wasted work.
-                    var expectedFileCount = countLocalFiles(topAbsolute);
-                    withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, topContainerPath, expectedFileCount));
-                    continue;
-                } catch (Exception e) {
-                    if (Thread.currentThread().isInterrupted()) {
-                        throw new IOException("Upload verification for '" + topRelative + "' was interrupted", e);
-                    }
-                    logger.info("Bulk upload failed for '{}', falling back to per-file upload. Reason: {}", topRelative, e.getMessage(), e);
-                    isBulkFallback = true;
-                }
+        if (wholeDirectoryUpload == null || !wholeDirectoryUpload.success()) {
+            // No sibling top-level group exists to fall back to — the empty-path group is the ONLY
+            // group, meaning relativePaths was just the whole-directory marker for a directory with no
+            // top-level contents. Skipping it below (as its real siblings' fallback does) and proceeding
+            // to uploadMarker would silently report success for a transfer that actually failed, so
+            // surface the failure instead. This can only happen when wholeDirectoryUpload is non-null
+            // (i.e. the marker was present and its bulk attempt actually ran and failed).
+            if (wholeDirectoryUpload != null && grouped.size() == 1) {
+                throw wholeDirectoryUpload.failure();
             }
 
-            for (var relative : entry.getValue()) {
-                var abs = localBaseDir.resolve(relative);
-                var target = containerPath(containerWorkingDir, relative);
-                // A no-op for OSS callers, whose relativePaths always resolve to regular files (the
-                // top-level directory case is already handled by the bulk branch above). EE callers walk
-                // the working dir into a List<Path> that can itself contain directory entries here.
-                var isDirectory = Files.isDirectory(abs);
-
-                if (isDirectory) {
-                    withRetries(logger, "uploadInputFiles", () -> container.dir(target).upload(abs));
-                } else {
-                    // A fresh InputStream is opened on every attempt (not just once outside the lambda):
-                    // withRetries may retry, and an already-consumed stream would upload zero bytes on a
-                    // retried attempt. Uses upload(InputStream) — a single 'cat' exec — rather than
-                    // upload(Path), which tars even a lone file and requires 'tar' in the sidecar.
-                    withRetries(
-                        logger, "uploadInputFiles",
-                        () -> {
-                            try (InputStream inputStream = Files.newInputStream(abs)) {
-                                return container.file(target).upload(inputStream);
-                            }
-                        }
-                    );
+            for (var entry : grouped.entrySet()) {
+                // The empty-path group's own (and only) value is the empty path itself, resolving to
+                // localBaseDir — re-uploading it here would just repeat the whole-directory transfer that
+                // already failed above, not recover from it. Its other, real top-level siblings are the
+                // actual fallback set.
+                if (entry.getKey().equals(EMPTY_RELATIVE_PATH)) {
+                    continue;
                 }
-
-                // Only cross-check per-file uploads when this is a fallback from a failed bulk-directory
-                // verification. Verifying every standalone top-level inputFile the same way would double
-                // pod round-trips on the common case (many unrelated individual inputFiles), for
-                // comparatively low risk since a single-file fabric8 upload is far less prone to silent
-                // truncation than the tar-based bulk-directory case.
-                if (isBulkFallback) {
-                    if (isDirectory) {
-                        var expectedFileCount = countLocalFiles(abs);
-                        withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, target, expectedFileCount));
-                    } else {
-                        withVerificationRetries(logger, "verifyFileUpload", () -> verifyFileUpload(container, logger, target, abs));
-                    }
-                }
+                uploadGroup(container, normalizedBaseDir, containerWorkingDir, entry.getKey(), entry.getValue(), logger);
             }
         }
 
@@ -711,6 +708,139 @@ public final class PodService {
                 logger.debug("uploadMarker exec failed but init container exited with code 0, marker was received");
             } else {
                 throw e;
+            }
+        }
+    }
+
+    /**
+     * Outcome of a single {@link #tryBulkUploadDirectory} attempt: on failure, carries the IOException
+     * that caused it, so a caller with no sibling fallback data of its own (the empty-path short-circuit
+     * in {@link #uploadInputFiles}) can surface it instead of silently reporting success. Callers that
+     * DO have a fallback (each per-top-level group in {@link #uploadGroup}) only ever consult {@link
+     * #success()} and let their own fallback logic take over on failure.
+     */
+    private record BulkUploadResult(boolean success, IOException failure) {
+        static BulkUploadResult succeeded() {
+            return new BulkUploadResult(true, null);
+        }
+
+        static BulkUploadResult failed(IOException failure) {
+            return new BulkUploadResult(false, failure);
+        }
+    }
+
+    /**
+     * Bulk-uploads {@code localDir} to {@code containerPath} as a single tar transfer, verifying the
+     * transferred file count once. Shared by the single whole-working-directory transfer in
+     * {@link #uploadInputFiles} and each per-top-level directory group's bulk attempt in
+     * {@link #uploadGroup} — only the retry-exhaustion/interrupt handling differs by caller, everything
+     * else about a "tar a local directory, then cross-check the pod-side count" transfer is identical.
+     *
+     * @param label describes {@code localDir} in log/exception messages (e.g. {@code "the whole working
+     *              directory"} or {@code "'data'"})
+     * @return a successful {@link BulkUploadResult} if the transfer and its verification succeeded, or a
+     *         failed one — carrying the triggering IOException — if the caller should fall back to a
+     *         slower upload strategy instead.
+     */
+    private static BulkUploadResult tryBulkUploadDirectory(
+        ContainerResource container,
+        Logger logger,
+        Path localDir,
+        String containerPath,
+        String label
+    ) throws IOException {
+        try {
+            withRetries(
+                logger, "uploadInputFilesBulk",
+                () -> container
+                    .dir(containerPath)
+                    .upload(localDir)
+            );
+            // A genuine truncation won't self-heal across retries — every attempt re-runs the same
+            // count check to the same wrong number, burning the full backoff before falling back.
+            // Retrying here anyway is intentional: it's the only thing that catches the transient
+            // race where 'find' runs just before the tar extraction is fully visible on the pod.
+            // Accepted tradeoff — correctness for the race case over shaving a few seconds off a
+            // failure path that already falls back to a slower re-upload regardless.
+            // The local count is walked once, outside the retry: it's the pod-side count that's
+            // racy, not the local filesystem, so re-walking it on every retry attempt is wasted work.
+            var expectedFileCount = countLocalFiles(localDir);
+            withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, containerPath, expectedFileCount));
+            return BulkUploadResult.succeeded();
+        } catch (Exception e) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IOException("Upload verification for " + label + " was interrupted", e);
+            }
+            logger.info("Bulk upload failed for {}, falling back to a slower upload. Reason: {}", label, e.getMessage(), e);
+            // withRetries/countLocalFiles/withVerificationRetries above only ever throw IOException, but
+            // the catch is intentionally broader (Exception) to also net any unchecked failure — wrap
+            // that case rather than assume the cast always holds.
+            var ioException = e instanceof IOException already ? already : new IOException("Bulk upload failed for " + label, e);
+            return BulkUploadResult.failed(ioException);
+        }
+    }
+
+    /**
+     * Uploads one top-level group from {@link #uploadInputFiles}'s grouping: a directory goes through a
+     * single bulk tar transfer (falling back to per-entry uploads, each individually verified, if that
+     * transfer's verification fails), while a standalone file streams directly.
+     */
+    private static void uploadGroup(
+        ContainerResource container,
+        Path localBaseDir,
+        String containerWorkingDir,
+        Path topRelative,
+        List<Path> values,
+        Logger logger
+    ) throws IOException {
+        var topAbsolute = localBaseDir.resolve(topRelative);
+        var topContainerPath = containerPath(containerWorkingDir, topRelative);
+
+        var isBulkFallback = false;
+        if (Files.isDirectory(topAbsolute)) {
+            if (tryBulkUploadDirectory(container, logger, topAbsolute, topContainerPath, "'" + topRelative + "'").success()) {
+                return;
+            }
+            isBulkFallback = true;
+        }
+
+        for (var relative : values) {
+            var abs = localBaseDir.resolve(relative);
+            var target = containerPath(containerWorkingDir, relative);
+            // A no-op for OSS callers, whose relativePaths always resolve to regular files (the
+            // top-level directory case is already handled by the bulk branch above). EE callers walk
+            // the working dir into a List<Path> that can itself contain directory entries here.
+            var isDirectory = Files.isDirectory(abs);
+
+            if (isDirectory) {
+                withRetries(logger, "uploadInputFiles", () -> container.dir(target).upload(abs));
+            } else {
+                // A fresh InputStream is opened on every attempt (not just once outside the lambda):
+                // withRetries may retry, and an already-consumed stream would upload zero bytes on a
+                // retried attempt. Uses upload(InputStream) — a single 'cat' exec — rather than
+                // upload(Path), which tars even a lone file and requires 'tar' in the sidecar.
+                withRetries(
+                    logger, "uploadInputFiles",
+                    () -> {
+                        try (InputStream inputStream = Files.newInputStream(abs)) {
+                            return container.file(target).upload(inputStream);
+                        }
+                    }
+                );
+            }
+
+            // Only cross-check per-file uploads when this is a fallback from a failed bulk-directory
+            // verification. Verifying every standalone top-level inputFile the same way would double
+            // pod round-trips on the common case (many unrelated individual inputFiles), for
+            // comparatively low risk since a single-file fabric8 upload is far less prone to silent
+            // truncation than the tar-based bulk-directory case.
+            if (isBulkFallback) {
+                if (isDirectory) {
+                    var expectedFileCount = countLocalFiles(abs);
+                    withVerificationRetries(logger, "verifyDirectoryUpload", () -> verifyDirectoryUpload(container, logger, target, expectedFileCount));
+                } else {
+                    withVerificationRetries(logger, "verifyFileUpload", () -> verifyFileUpload(container, logger, target, abs));
+                }
             }
         }
     }
