@@ -4,10 +4,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 import io.kestra.core.models.tasks.runners.AbstractLogConsumer;
@@ -105,22 +105,21 @@ public class LoggingOutputStream extends java.io.OutputStream {
             return;
         }
 
-        // Split by any whitespace to safely extract a potential ISO timestamp prefix injected by k8s
-        ArrayList<String> logs = new ArrayList<>(Arrays.asList(lineWithTimestamp.split("\\s+")));
+        // Split on the FIRST whitespace run only, to strip the ISO timestamp prefix k8s injects. Splitting on
+        // every run and rejoining with a single space would rewrite the message itself, collapsing any run of
+        // spaces the command actually emitted.
+        List<String> parts = Arrays.asList(lineWithTimestamp.split("\\s+", 2));
         String message = lineWithTimestamp;
 
-        if (!logs.isEmpty()) {
-            try {
-                Instant newTimestamp = Instant.parse(logs.getFirst());
-                // Only update lastTimestamp if the new timestamp is newer (handles out-of-order log arrivals)
-                if (lastTimestamp == null || newTimestamp.isAfter(lastTimestamp)) {
-                    lastTimestamp = newTimestamp;
-                }
-                logs.remove(0);
-                message = String.join(" ", logs);
-            } catch (DateTimeParseException ignored) {
-                // No valid timestamp, use line as-is
+        try {
+            Instant newTimestamp = Instant.parse(parts.get(0));
+            // Only update lastTimestamp if the new timestamp is newer (handles out-of-order log arrivals)
+            if (lastTimestamp == null || newTimestamp.isAfter(lastTimestamp)) {
+                lastTimestamp = newTimestamp;
             }
+            message = parts.size() > 1 ? parts.get(1) : "";
+        } catch (DateTimeParseException ignored) {
+            // No valid timestamp, use line as-is
         }
 
         // Rate limiting: add small delay between emissions to prevent overwhelming async queue
