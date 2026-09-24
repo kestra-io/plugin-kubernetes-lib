@@ -4,8 +4,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 
 import io.kestra.core.models.tasks.runners.AbstractLogConsumer;
@@ -106,16 +108,16 @@ public class LoggingOutputStream extends java.io.OutputStream {
         // Split on the FIRST whitespace run only, to strip the ISO timestamp prefix k8s injects. Splitting on
         // every run and rejoining with a single space would rewrite the message itself, collapsing any run of
         // spaces the command actually emitted.
-        String[] parts = lineWithTimestamp.split("\\s+", 2);
+        List<String> parts = Arrays.asList(lineWithTimestamp.split("\\s+", 2));
         String message = lineWithTimestamp;
 
         try {
-            Instant newTimestamp = Instant.parse(parts[0]);
+            Instant newTimestamp = Instant.parse(parts.get(0));
             // Only update lastTimestamp if the new timestamp is newer (handles out-of-order log arrivals)
             if (lastTimestamp == null || newTimestamp.isAfter(lastTimestamp)) {
                 lastTimestamp = newTimestamp;
             }
-            message = parts.length > 1 ? parts[1] : "";
+            message = parts.size() > 1 ? parts.get(1) : "";
         } catch (DateTimeParseException ignored) {
             // No valid timestamp, use line as-is
         }
