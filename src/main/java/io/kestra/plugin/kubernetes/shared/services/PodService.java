@@ -330,10 +330,11 @@ public final class PodService {
             return;
         }
 
-        ContainerStateTerminated terminated = failed.get().getState().getTerminated();
-        String errorMsg = containerFailureMessage(failed.get());
+        var terminated = failed.get().getState().getTerminated();
+        var errorMsg = containerFailureMessage(failed.get());
+        var exitCode = terminated != null ? terminated.getExitCode() : -1;
         logger.error(errorMsg);
-        throw new TaskException(errorMsg, terminated.getExitCode(), defaultLogConsumer);
+        throw new TaskException(errorMsg, exitCode, defaultLogConsumer);
     }
 
     private static Optional<ContainerStatus> findFailedContainer(Pod pod, String exceptContainer) {

@@ -1,5 +1,6 @@
 package io.kestra.plugin.kubernetes.shared.services;
 
+import static org.hamcrest.Matchers.containsString;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -562,6 +563,7 @@ class PodServiceTest {
 
         assertFalse(Files.exists(staleMarkerFile), "the stale marker file must be cleaned up so the next run can create it again");
     }
+
     @Test
     void checkContainerFailuresShouldPreserveContainerExitCode() {
         var pod = new PodBuilder()
@@ -571,6 +573,8 @@ class PodServiceTest {
             .withNewState()
             .withNewTerminated()
             .withExitCode(137)
+            .withReason("Error")
+            .withMessage("Container process failed")
             .endTerminated()
             .endState()
             .endContainerStatus()
@@ -586,5 +590,6 @@ class PodServiceTest {
         );
 
         assertThat(exception.getExitCode(), is(137));
+        assertThat(exception.getMessage(), containsString("Container 'main' failed with exit code 137"));
     }
 }
