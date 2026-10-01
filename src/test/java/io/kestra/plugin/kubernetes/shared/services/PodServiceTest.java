@@ -34,6 +34,7 @@ import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -591,5 +592,101 @@ class PodServiceTest {
 
         assertThat(exception.getExitCode(), is(137));
         assertThat(exception.getMessage(), containsString("Container 'main' failed with exit code 137"));
+    }
+
+    @Test
+    void firstFailingOrFirstTerminatedShouldSelectFailingContainerOverSucceededContainer() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Failed")
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(0)
+            .withMessage("Main succeeded")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .addNewContainerStatus()
+            .withName("sidecar")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(1)
+            .withMessage("Sidecar error")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var selected = PodService.firstFailingOrFirstTerminated(pod);
+        assertTrue(selected.isPresent());
+        assertThat(selected.get().getExitCode(), is(1));
+        assertThat(selected.get().getMessage(), is("Sidecar error"));
+
+        assertThat(PodService.firstTerminatedExitCode(pod), is(1));
+
+        var exception = PodService.failedMessage(pod);
+        assertThat(exception.getMessage(), containsString("exitcode '1'"));
+        assertThat(exception.getMessage(), containsString("message 'Sidecar error'"));
+    }
+
+    @Test
+    void firstFailingOrFirstTerminatedShouldFallbackToFirstTerminatedWhenNoContainerFailed() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Succeeded")
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(0)
+            .withMessage("Main done")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .addNewContainerStatus()
+            .withName("sidecar")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(0)
+            .withMessage("Sidecar done")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var selected = PodService.firstFailingOrFirstTerminated(pod);
+        assertTrue(selected.isPresent());
+        assertThat(selected.get().getExitCode(), is(0));
+        assertThat(selected.get().getMessage(), is("Main done"));
+
+        assertThat(PodService.firstTerminatedExitCode(pod), is(0));
+
+        var exception = PodService.failedMessage(pod);
+        assertThat(exception.getMessage(), containsString("exitcode '0'"));
+        assertThat(exception.getMessage(), containsString("message 'Main done'"));
+    }
+
+    @Test
+    void firstTerminatedExitCodeShouldReturnMinusOneWhenNoTerminatedContainers() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Pending")
+            .addNewContainerStatus()
+            .withName("main")
+            .withNewState()
+            .withNewWaiting()
+            .withReason("ContainerCreating")
+            .endWaiting()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        assertTrue(PodService.firstFailingOrFirstTerminated(pod).isEmpty());
+        assertThat(PodService.firstTerminatedExitCode(pod), is(-1));
     }
 }

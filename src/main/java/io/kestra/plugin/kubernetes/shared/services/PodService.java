@@ -16,6 +16,7 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -272,16 +273,37 @@ public final class PodService {
         throw new KubernetesClientTimeoutException(pod, waitRunning.toSeconds(), TimeUnit.SECONDS);
     }
 
+    public static Optional<ContainerStateTerminated> firstFailingOrFirstTerminated(Pod pod) {
+        if (pod == null || pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
+            return Optional.empty();
+        }
+
+        var terminated = pod.getStatus().getContainerStatuses().stream()
+            .map(ContainerStatus::getState)
+            .filter(Objects::nonNull)
+            .map(ContainerState::getTerminated)
+            .filter(Objects::nonNull)
+            .toList();
+
+        return terminated.stream()
+            .filter(c -> c.getExitCode() != null && c.getExitCode() != 0)
+            .findFirst()
+            .or(() -> terminated.stream().findFirst());
+    }
+
+    public static int firstTerminatedExitCode(Pod pod) {
+        return firstFailingOrFirstTerminated(pod)
+            .map(ContainerStateTerminated::getExitCode)
+            .filter(Objects::nonNull)
+            .orElse(-1);
+    }
+
     public static IllegalStateException failedMessage(Pod pod) throws IllegalStateException {
-        if (pod.getStatus() == null) {
+        if (pod == null || pod.getStatus() == null) {
             return new IllegalStateException("Pods terminated without any status !");
         }
 
-        return (pod.getStatus().getContainerStatuses() == null ? new ArrayList<ContainerStatus>() : pod.getStatus().getContainerStatuses())
-            .stream()
-            .filter(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null)
-            .map(containerStatus -> containerStatus.getState().getTerminated())
-            .findFirst()
+        return firstFailingOrFirstTerminated(pod)
             .map(
                 containerStateTerminated -> new IllegalStateException(
                     "Pods terminated with status '" + pod.getStatus().getPhase() + "', " +
@@ -292,7 +314,7 @@ public final class PodService {
             .orElseGet(() ->
             {
                 if (pod.getStatus().getContainerStatuses() != null) {
-                    Optional<String> waitingReason = pod.getStatus().getContainerStatuses().stream()
+                    var waitingReason = pod.getStatus().getContainerStatuses().stream()
                         .filter(cs -> cs.getState() != null && cs.getState().getWaiting() != null)
                         .map(cs -> cs.getState().getWaiting().getReason())
                         .filter(reason -> reason != null && !TransientWaitingReason.contains(reason))
