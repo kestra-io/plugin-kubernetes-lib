@@ -273,7 +273,7 @@ public final class PodService {
         throw new KubernetesClientTimeoutException(pod, waitRunning.toSeconds(), TimeUnit.SECONDS);
     }
 
-    public static Optional<ContainerStateTerminated> firstFailingOrFirstTerminated(Pod pod) {
+    static Optional<ContainerStateTerminated> firstFailingOrFirstTerminated(Pod pod) {
         if (pod == null || pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
             return Optional.empty();
         }
@@ -367,7 +367,7 @@ public final class PodService {
         return pod.getStatus().getContainerStatuses().stream()
             .filter(containerStatus -> !containerStatus.getName().equals(exceptContainer))
             .filter(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null)
-            .filter(containerStatus -> containerStatus.getState().getTerminated().getExitCode() != 0)
+            .filter(containerStatus -> containerStatus.getState().getTerminated().getExitCode() != null && containerStatus.getState().getTerminated().getExitCode() != 0)
             .findFirst();
     }
 

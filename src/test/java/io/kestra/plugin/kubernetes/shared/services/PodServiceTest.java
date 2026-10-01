@@ -34,7 +34,6 @@ import static org.hamcrest.Matchers.is;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -621,7 +620,7 @@ class PodServiceTest {
             .build();
 
         var selected = PodService.firstFailingOrFirstTerminated(pod);
-        assertTrue(selected.isPresent());
+        assertThat(selected.isPresent(), is(true));
         assertThat(selected.get().getExitCode(), is(1));
         assertThat(selected.get().getMessage(), is("Sidecar error"));
 
@@ -659,7 +658,7 @@ class PodServiceTest {
             .build();
 
         var selected = PodService.firstFailingOrFirstTerminated(pod);
-        assertTrue(selected.isPresent());
+        assertThat(selected.isPresent(), is(true));
         assertThat(selected.get().getExitCode(), is(0));
         assertThat(selected.get().getMessage(), is("Main done"));
 
@@ -686,7 +685,58 @@ class PodServiceTest {
             .endStatus()
             .build();
 
-        assertTrue(PodService.firstFailingOrFirstTerminated(pod).isEmpty());
+        assertThat(PodService.firstFailingOrFirstTerminated(pod).isEmpty(), is(true));
         assertThat(PodService.firstTerminatedExitCode(pod), is(-1));
+    }
+
+    @Test
+    void firstFailingOrFirstTerminatedShouldSelectFirstFailingWhenMultipleContainersFailed() {
+        var pod = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Failed")
+            .addNewContainerStatus()
+            .withName("primary")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(1)
+            .withMessage("First failure")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .addNewContainerStatus()
+            .withName("secondary")
+            .withNewState()
+            .withNewTerminated()
+            .withExitCode(2)
+            .withMessage("Second failure")
+            .endTerminated()
+            .endState()
+            .endContainerStatus()
+            .endStatus()
+            .build();
+
+        var selected = PodService.firstFailingOrFirstTerminated(pod);
+        assertThat(selected.isPresent(), is(true));
+        assertThat(selected.get().getExitCode(), is(1));
+        assertThat(selected.get().getMessage(), is("First failure"));
+        assertThat(PodService.firstTerminatedExitCode(pod), is(1));
+    }
+
+    @Test
+    void firstFailingOrFirstTerminatedShouldHandleNullStatusGracefully() {
+        assertThat(PodService.firstFailingOrFirstTerminated(null).isEmpty(), is(true));
+        assertThat(PodService.firstTerminatedExitCode(null), is(-1));
+
+        var podWithNullStatus = new PodBuilder().build();
+        assertThat(PodService.firstFailingOrFirstTerminated(podWithNullStatus).isEmpty(), is(true));
+        assertThat(PodService.firstTerminatedExitCode(podWithNullStatus), is(-1));
+
+        var podWithNullContainers = new PodBuilder()
+            .withNewStatus()
+            .withPhase("Pending")
+            .endStatus()
+            .build();
+        assertThat(PodService.firstFailingOrFirstTerminated(podWithNullContainers).isEmpty(), is(true));
+        assertThat(PodService.firstTerminatedExitCode(podWithNullContainers), is(-1));
     }
 }
