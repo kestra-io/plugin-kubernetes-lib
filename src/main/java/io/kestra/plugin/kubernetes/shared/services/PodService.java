@@ -50,6 +50,9 @@ public final class PodService {
 
     private static final List<String> COMPLETED_PHASES = List.of(PodPhase.SUCCEEDED.value(), PodPhase.FAILED.value(), PodPhase.UNKNOWN.value()); // see https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-phase
     private static final String SIDECAR_FILES_CONTAINER_NAME = "out-files";
+    private static final String OOM_KILLED_REASON = "OOMKilled";
+    private static final String DISRUPTION_TARGET_CONDITION = "DisruptionTarget";
+    private static final int SIGKILL_EXIT_CODE = 137;
 
     // EE's marker for "upload the whole working directory" in uploadInputFiles — see its Javadoc.
     private static final Path EMPTY_RELATIVE_PATH = Path.of("");
@@ -274,19 +277,23 @@ public final class PodService {
     }
 
     static Optional<ContainerStateTerminated> firstFailingOrFirstTerminated(Pod pod) {
+        return firstFailingOrFirstTerminatedStatus(pod).map(containerStatus -> containerStatus.getState().getTerminated());
+    }
+
+    private static Optional<ContainerStatus> firstFailingOrFirstTerminatedStatus(Pod pod) {
         if (pod == null || pod.getStatus() == null || pod.getStatus().getContainerStatuses() == null) {
             return Optional.empty();
         }
 
         var terminated = pod.getStatus().getContainerStatuses().stream()
-            .map(ContainerStatus::getState)
-            .filter(Objects::nonNull)
-            .map(ContainerState::getTerminated)
-            .filter(Objects::nonNull)
+            .filter(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null)
             .toList();
 
         return terminated.stream()
-            .filter(c -> c.getExitCode() != null && c.getExitCode() != 0)
+            .filter(containerStatus -> {
+                var exitCode = containerStatus.getState().getTerminated().getExitCode();
+                return exitCode != null && exitCode != 0;
+            })
             .findFirst()
             .or(() -> terminated.stream().findFirst());
     }
@@ -303,14 +310,23 @@ public final class PodService {
             return new IllegalStateException("Pods terminated without any status !");
         }
 
-        return firstFailingOrFirstTerminated(pod)
-            .map(
-                containerStateTerminated -> new IllegalStateException(
+        return firstFailingOrFirstTerminatedStatus(pod)
+            .map(containerStatus -> {
+                var terminated = containerStatus.getState().getTerminated();
+                var details = new ArrayList<Detail>();
+                details.add(new Detail("container", containerStatus.getName()));
+                if (terminated.getReason() != null) {
+                    details.add(new Detail("reason", terminated.getReason()));
+                }
+                details.addAll(terminationDetails(pod, containerStatus));
+
+                return new IllegalStateException(
                     "Pods terminated with status '" + pod.getStatus().getPhase() + "', " +
-                        "exitcode '" + containerStateTerminated.getExitCode() + "' & " +
-                        "message '" + containerStateTerminated.getMessage() + "'"
-                )
-            )
+                        "exitcode '" + terminated.getExitCode() + "'" +
+                        (terminated.getMessage() != null ? " & message '" + terminated.getMessage() + "'" : "") +
+                        ", " + quoted(details) + sigkillHint(terminated)
+                );
+            })
             .orElseGet(() ->
             {
                 if (pod.getStatus().getContainerStatuses() != null) {
@@ -323,7 +339,11 @@ public final class PodService {
                         return new IllegalStateException("Pod failed before container start: " + waitingReason.get());
                     }
                 }
-                return new IllegalStateException("Pod failed with phase '" + pod.getStatus().getPhase() + "'");
+                var podDetails = podDetails(pod);
+                return new IllegalStateException(
+                    "Pod failed with phase '" + pod.getStatus().getPhase() + "'" +
+                        (podDetails.isEmpty() ? "" : ", " + quoted(podDetails))
+                );
             });
     }
 
@@ -337,7 +357,7 @@ public final class PodService {
             return;
         }
 
-        String errorMsg = containerFailureMessage(failed.get());
+        String errorMsg = containerFailureMessage(pod, failed.get());
         logger.error(errorMsg);
         throw new IllegalStateException(errorMsg);
     }
@@ -353,7 +373,7 @@ public final class PodService {
         }
 
         var terminated = failed.get().getState().getTerminated();
-        var errorMsg = containerFailureMessage(failed.get());
+        var errorMsg = containerFailureMessage(pod, failed.get());
         var exitCode = terminated != null ? terminated.getExitCode() : -1;
         logger.error(errorMsg);
         throw new TaskException(errorMsg, exitCode, defaultLogConsumer);
@@ -371,12 +391,92 @@ public final class PodService {
             .findFirst();
     }
 
-    private static String containerFailureMessage(ContainerStatus containerStatus) {
-        ContainerStateTerminated terminated = containerStatus.getState().getTerminated();
+    private static String containerFailureMessage(Pod pod, ContainerStatus containerStatus) {
+        var terminated = containerStatus.getState().getTerminated();
+        var details = terminationDetails(pod, containerStatus);
         return "Container '" + containerStatus.getName() + "' failed with exit code " +
             terminated.getExitCode() +
             (terminated.getReason() != null ? ", reason: " + terminated.getReason() : "") +
-            (terminated.getMessage() != null ? ", message: " + terminated.getMessage() : "");
+            (terminated.getMessage() != null ? ", message: " + terminated.getMessage() : "") +
+            (details.isEmpty() ? "" : ", " + colonSeparated(details)) +
+            sigkillHint(terminated);
+    }
+
+    private record Detail(String label, String value) {}
+
+    /** The DisruptionTarget condition is absent before Kubernetes 1.26, so every detail is optional. */
+    private static List<Detail> terminationDetails(Pod pod, ContainerStatus containerStatus) {
+        var terminated = containerStatus.getState().getTerminated();
+        var details = new ArrayList<Detail>();
+
+        if (OOM_KILLED_REASON.equals(terminated.getReason())) {
+            memoryLimit(pod, containerStatus.getName()).ifPresent(limit -> details.add(new Detail("memory limit", limit)));
+        }
+        if (terminated.getSignal() != null) {
+            details.add(new Detail("signal", String.valueOf(terminated.getSignal())));
+        }
+        details.addAll(podDetails(pod));
+
+        return details;
+    }
+
+    private static List<Detail> podDetails(Pod pod) {
+        var details = new ArrayList<Detail>();
+        if (pod.getStatus() != null && pod.getStatus().getReason() != null) {
+            details.add(new Detail("pod reason", pod.getStatus().getReason()));
+            if (pod.getStatus().getMessage() != null) {
+                details.add(new Detail("pod message", pod.getStatus().getMessage()));
+            }
+        }
+        disruptionReason(pod).ifPresent(reason -> details.add(new Detail("disruption", reason)));
+
+        return details;
+    }
+
+    private static String sigkillHint(ContainerStateTerminated terminated) {
+        if (OOM_KILLED_REASON.equals(terminated.getReason()) || !Integer.valueOf(SIGKILL_EXIT_CODE).equals(terminated.getExitCode())) {
+            return "";
+        }
+
+        return " (exit code 137 means the process received SIGKILL; possible causes: OOM kill of a child process, eviction, node shutdown or pod deletion)";
+    }
+
+    private static String quoted(List<Detail> details) {
+        return details.stream()
+            .map(detail -> detail.label() + " '" + detail.value() + "'")
+            .collect(Collectors.joining(", "));
+    }
+
+    private static String colonSeparated(List<Detail> details) {
+        return details.stream()
+            .map(detail -> detail.label() + ": " + detail.value())
+            .collect(Collectors.joining(", "));
+    }
+
+    private static Optional<String> memoryLimit(Pod pod, String containerName) {
+        if (pod.getSpec() == null || pod.getSpec().getContainers() == null) {
+            return Optional.empty();
+        }
+
+        return pod.getSpec().getContainers().stream()
+            .filter(container -> Objects.equals(container.getName(), containerName))
+            .findFirst()
+            .map(Container::getResources)
+            .map(ResourceRequirements::getLimits)
+            .map(limits -> limits.get("memory"))
+            .map(quantity -> quantity.getAmount() + Objects.toString(quantity.getFormat(), ""));
+    }
+
+    private static Optional<String> disruptionReason(Pod pod) {
+        if (pod.getStatus() == null || pod.getStatus().getConditions() == null) {
+            return Optional.empty();
+        }
+
+        return pod.getStatus().getConditions().stream()
+            .filter(condition -> DISRUPTION_TARGET_CONDITION.equals(condition.getType()) && "True".equals(condition.getStatus()))
+            .map(PodCondition::getReason)
+            .filter(Objects::nonNull)
+            .findFirst();
     }
 
     public static PodResource podRef(KubernetesClient client, Pod pod) {
