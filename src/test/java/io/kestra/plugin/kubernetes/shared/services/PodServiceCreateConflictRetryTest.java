@@ -4,7 +4,11 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.sameInstance;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.hamcrest.Matchers.both;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockingDetails;
 import static org.mockito.Mockito.verify;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -123,6 +127,29 @@ class PodServiceCreateConflictRetryTest {
             assertThat(Thread.currentThread().isInterrupted(), is(true));
         } finally {
             Thread.interrupted();
+        }
+    }
+
+    @Test
+    void backoffGrowsExponentiallyWithJitterAndCap() {
+        var calls = new AtomicInteger();
+
+        assertThrows(
+            KubernetesClientException.class,
+            () -> PodService.createWithConflictRetry(
+                logger, "pod", failing(calls, Integer.MAX_VALUE, exception(409, "Conflict")), Duration.ofMillis(8), Duration.ofMillis(20)
+            )
+        );
+
+        var delays = mockingDetails(logger).getInvocations().stream()
+            .filter(invocation -> invocation.getMethod().getName().equals("warn"))
+            .map(invocation -> (Long) invocation.getArguments()[5])
+            .toList();
+        var ceilings = new long[]{8, 16, 20, 20};
+
+        assertThat(delays.size(), is(ceilings.length));
+        for (var i = 0; i < ceilings.length; i++) {
+            assertThat(delays.get(i), is(both(greaterThanOrEqualTo(ceilings[i] / 2)).and(lessThanOrEqualTo(ceilings[i]))));
         }
     }
 }

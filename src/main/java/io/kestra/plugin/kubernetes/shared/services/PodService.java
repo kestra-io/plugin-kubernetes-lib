@@ -558,13 +558,7 @@ public final class PodService {
         }
     }
 
-    /**
-     * Runs a create call, retrying when the API server answers {@code 409 Conflict}. On clusters with several
-     * kube-apiservers, concurrent creates in a namespace with a ResourceQuota can lose the quota-admission
-     * optimistic-lock race ("the object has been modified"); the resource was never persisted, so retrying is safe.
-     * {@code 409 AlreadyExists} and every other failure are rethrown immediately. On exhaustion the last original
-     * exception is rethrown.
-     */
+    // Quota-admission 409 Conflict on multi-apiserver clusters means the resource was never persisted, so retrying is safe.
     public static <T> T createWithConflictRetry(Logger logger, String what, Supplier<T> create) {
         return createWithConflictRetry(logger, what, create, CONFLICT_RETRY_INITIAL_DELAY, CONFLICT_RETRY_MAX_DELAY);
     }
@@ -579,7 +573,6 @@ public final class PodService {
                 }
 
                 var delayMs = Math.min(maxDelay.toMillis(), initialDelay.toMillis() << (attempt - 1));
-                // Jitter in [delay/2, delay] so concurrent callers hitting the same conflict do not retry in lockstep.
                 delayMs = delayMs / 2 + ThreadLocalRandom.current().nextLong(delayMs / 2 + 1);
 
                 logger.warn(
