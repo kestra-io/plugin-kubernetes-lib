@@ -1,27 +1,27 @@
 package io.kestra.plugin.kubernetes.shared.services;
 
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.is;
-import static org.hamcrest.Matchers.sameInstance;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.hamcrest.Matchers.both;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
+import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.mockingDetails;
-import static org.mockito.Mockito.verify;
+import static org.hamcrest.Matchers.sameInstance;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.slf4j.Logger;
 
 import io.fabric8.kubernetes.api.model.StatusBuilder;
@@ -141,10 +141,9 @@ class PodServiceCreateConflictRetryTest {
             )
         );
 
-        var delays = mockingDetails(logger).getInvocations().stream()
-            .filter(invocation -> invocation.getMethod().getName().equals("warn"))
-            .map(invocation -> (Long) invocation.getArguments()[5])
-            .toList();
+        var captor = ArgumentCaptor.forClass(Long.class);
+        verify(logger, times(4)).warn(anyString(), eq("pod"), anyString(), anyInt(), anyInt(), captor.capture(), any());
+        var delays = captor.getAllValues();
         var ceilings = new long[]{8, 16, 20, 20};
 
         assertThat(delays.size(), is(ceilings.length));
