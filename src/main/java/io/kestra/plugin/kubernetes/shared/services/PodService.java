@@ -19,10 +19,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -64,6 +66,9 @@ public final class PodService {
     public static final int EXEC_READY_WAIT_TIMEOUT_MS = 30_000;
 
     private static final int UPLOAD_RETRY_MAX_ATTEMPTS = 5;
+    private static final int CONFLICT_RETRY_MAX_ATTEMPTS = 5;
+    private static final Duration CONFLICT_RETRY_INITIAL_DELAY = Duration.ofMillis(100);
+    private static final Duration CONFLICT_RETRY_MAX_DELAY = Duration.ofSeconds(2);
 
     public static final Duration DEFAULT_RETRY_MAX_DURATION = Duration.ofSeconds(60);
 
@@ -551,6 +556,51 @@ public final class PodService {
         } catch (Throwable e) {
             throw new IOException("Failed to call '" + where + "'", e);
         }
+    }
+
+    // Quota-admission 409 Conflict on multi-apiserver clusters means the resource was never persisted, so retrying is safe.
+    public static <T> T createWithConflictRetry(Logger logger, String what, Supplier<T> create) {
+        return createWithConflictRetry(logger, what, create, CONFLICT_RETRY_INITIAL_DELAY, CONFLICT_RETRY_MAX_DELAY);
+    }
+
+    static <T> T createWithConflictRetry(Logger logger, String what, Supplier<T> create, Duration initialDelay, Duration maxDelay) {
+        for (var attempt = 1; ; attempt++) {
+            try {
+                return create.get();
+            } catch (KubernetesClientException e) {
+                if (!isTransientConflict(e) || attempt >= CONFLICT_RETRY_MAX_ATTEMPTS) {
+                    throw e;
+                }
+
+                var delayMs = Math.min(maxDelay.toMillis(), initialDelay.toMillis() << (attempt - 1));
+                delayMs = delayMs / 2 + ThreadLocalRandom.current().nextLong(delayMs / 2 + 1);
+
+                logger.warn(
+                    "Conflict creating {}{} (attempt {}/{}), retrying in {} ms: {}",
+                    what, conflictingResource(e), attempt, CONFLICT_RETRY_MAX_ATTEMPTS, delayMs, e.getMessage()
+                );
+
+                try {
+                    Thread.sleep(delayMs);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+    }
+
+    static boolean isTransientConflict(KubernetesClientException e) {
+        return e.getCode() == 409 && e.getStatus() != null && "Conflict".equals(e.getStatus().getReason());
+    }
+
+    private static String conflictingResource(KubernetesClientException e) {
+        var details = e.getStatus().getDetails();
+        if (details == null || details.getKind() == null) {
+            return "";
+        }
+
+        return " (conflicting resource: " + details.getKind() + (details.getName() != null ? "/" + details.getName() : "") + ")";
     }
 
     /**
