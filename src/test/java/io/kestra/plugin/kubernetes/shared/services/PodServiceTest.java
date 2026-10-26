@@ -262,7 +262,7 @@ class PodServiceTest {
             );
 
             assertThat(exception.getMessage(), is("Pod was deleted before reaching a terminal phase: pod-1"));
-            Mockito.verify(podResource).get();
+            Mockito.verify(podResource, Mockito.never()).get();
         }
     }
 
@@ -1055,5 +1055,307 @@ class PodServiceTest {
         );
 
         assertThat(exception.getMessage(), is("Container 'main' failed with exit code 137, reason: Error (exit code 137 means the process received SIGKILL; possible causes: OOM kill of a child process, eviction, node shutdown or pod deletion)"));
+    }
+
+    @Test
+    void waitForCompletionShouldThrowWhenPodDeletedAfterWatchTimeout() {
+        var client = mock(KubernetesClient.class);
+        var logger = mock(Logger.class);
+        var podResource = mock(PodResource.class);
+        var pod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-timeout")
+            .withNamespace("default")
+            .endMetadata()
+            .build();
+
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenThrow(new KubernetesClientTimeoutException("Timed out", "Pod", "pod-timeout", 10L, TimeUnit.SECONDS));
+        when(podResource.get()).thenReturn(null);
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, pod)).thenReturn(podResource);
+
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForCompletion(client, logger, pod, Duration.ofMinutes(10))
+            );
+
+            assertThat(exception.getMessage(), is("Pod was deleted before reaching a terminal phase: pod-timeout"));
+            Mockito.verify(podResource).get();
+        }
+    }
+
+    @Test
+    void waitForCompletionShouldShortCircuitWhenPodIsDeletedDuringWait() {
+        var client = mock(KubernetesClient.class);
+        var logger = mock(Logger.class);
+        var podResource = mock(PodResource.class);
+        var pod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-deleted-short-circuit")
+            .withNamespace("default")
+            .endMetadata()
+            .build();
+
+        // Simulate Fabric8 receiving a DELETED watch event by passing null to the condition predicate.
+        // The wrapped predicate returns true on null, causing waitUntilCondition to return null immediately.
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                if (condition.test(null)) {
+                    return null;
+                }
+                throw new KubernetesClientTimeoutException(pod, 300L, TimeUnit.SECONDS);
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, pod)).thenReturn(podResource);
+
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForCompletion(client, logger, pod, Duration.ofMinutes(10))
+            );
+
+            assertThat(exception.getMessage(), is("Pod was deleted before reaching a terminal phase: pod-deleted-short-circuit"));
+            verify(logger).warn(Mockito.eq("Pod '{}' was deleted before reaching a terminal phase"), Mockito.eq("pod-deleted-short-circuit"));
+            // The wait terminated immediately via the null event without needing a fallback GET
+            verify(podResource, never()).get();
+        }
+    }
+
+    @Test
+    void waitForCompletionExceptShouldShortCircuitWhenPodIsDeletedDuringWait() {
+        var client = mock(KubernetesClient.class);
+        var logger = mock(Logger.class);
+        var podResource = mock(PodResource.class);
+        var pod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-except-deleted")
+            .withNamespace("default")
+            .endMetadata()
+            .build();
+
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                if (condition.test(null)) {
+                    return null;
+                }
+                throw new KubernetesClientTimeoutException(pod, 300L, TimeUnit.SECONDS);
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, pod)).thenReturn(podResource);
+
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForCompletionExcept(client, logger, pod, Duration.ofMinutes(10), "sidecar")
+            );
+
+            assertThat(exception.getMessage(), is("Pod was deleted before reaching a terminal phase: pod-except-deleted"));
+            verify(logger).warn(Mockito.eq("Pod '{}' was deleted before reaching a terminal phase"), Mockito.eq("pod-except-deleted"));
+            verify(podResource, never()).get();
+        }
+    }
+
+    @Test
+    void waitForContainersStartedOrCompletedShouldShortCircuitWhenPodIsDeletedDuringWait() {
+        var client = mock(KubernetesClient.class);
+        var logger = mock(Logger.class);
+        var podResource = mock(PodResource.class);
+        var pendingPod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-pending-deleted")
+            .withNamespace("default")
+            .endMetadata()
+            .withNewStatus()
+            .withPhase("Pending")
+            .endStatus()
+            .build();
+
+        // Fast-path GET returns pending pod so watch is entered
+        when(podResource.get()).thenReturn(pendingPod);
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                if (condition.test(null)) {
+                    return null;
+                }
+                throw new KubernetesClientTimeoutException(pendingPod, 300L, TimeUnit.SECONDS);
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, pendingPod)).thenReturn(podResource);
+
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForContainersStartedOrCompleted(client, logger, pendingPod, Duration.ofMinutes(10))
+            );
+
+            assertThat(exception.getMessage(), is("Pod was deleted while waiting for containers to start: pod-pending-deleted"));
+            // Exactly 1 get call (fast path initial check); no fallback get after null wait result
+            verify(podResource, Mockito.times(1)).get();
+        }
+    }
+
+    @Test
+    void waitForCompletionShouldTerminateWhenPodIsRecreatedWithSameName() {
+        var client = mock(KubernetesClient.class);
+        var logger = mock(Logger.class);
+        var podResource = mock(PodResource.class);
+        var originalPod = new PodBuilder()
+            .withNewMetadata()
+            .withName("recreated-pod")
+            .withNamespace("default")
+            .withUid("original-uid")
+            .endMetadata()
+            .build();
+
+        var newPod = new PodBuilder()
+            .withNewMetadata()
+            .withName("recreated-pod")
+            .withNamespace("default")
+            .withUid("new-uid")
+            .endMetadata()
+            .withNewStatus()
+            .withPhase("Running")
+            .endStatus()
+            .build();
+
+        // Original pod watch sees DELETED event
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                if (condition.test(null)) {
+                    return null;
+                }
+                throw new KubernetesClientTimeoutException(originalPod, 300L, TimeUnit.SECONDS);
+            });
+        // If it were to call get(), it would see the new pod
+        when(podResource.get()).thenReturn(newPod);
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, originalPod)).thenReturn(podResource);
+
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForCompletion(client, logger, originalPod, Duration.ofMinutes(10))
+            );
+
+            assertThat(exception.getMessage(), is("Pod was deleted before reaching a terminal phase: recreated-pod"));
+            // Old wait must end immediately via null event and not inspect current cluster state
+            verify(podResource, never()).get();
+        }
+    }
+
+    @Test
+    void withRetriesShouldNotRetryOn404() {
+        var logger = mock(Logger.class);
+        var attempts = new AtomicInteger(0);
+
+        var exception = assertThrows(
+            IOException.class,
+            () -> PodService.withRetries(
+                logger,
+                "uploadMarker",
+                () -> {
+                    attempts.incrementAndGet();
+                    throw new KubernetesClientException("pods \"test-pod\" not found", 404, null);
+                }
+            )
+        );
+
+        assertThat("404 errors must not be retried and must fail on the first attempt", attempts.get(), is(1));
+        assertThat(exception.getCause(), is(org.hamcrest.Matchers.instanceOf(KubernetesClientException.class)));
+        assertThat(((KubernetesClientException) exception.getCause()).getCode(), is(404));
+    }
+
+    @Test
+    void withRetriesShouldNotRetryWhen404IsWrappedInCause() {
+        var logger = mock(Logger.class);
+        var attempts = new AtomicInteger(0);
+
+        var exception = assertThrows(
+            IOException.class,
+            () -> PodService.withRetries(
+                logger,
+                "uploadInputFiles",
+                () -> {
+                    attempts.incrementAndGet();
+                    throw new RuntimeException("wrapped", new KubernetesClientException("not found", 404, null));
+                }
+            )
+        );
+
+        assertThat("Wrapped 404 errors must not be retried", attempts.get(), is(1));
+    }
+
+    @Test
+    void waitForCompletionShouldSucceedWhenPodReachesCompletedPhaseNaturally() {
+        var client = mock(KubernetesClient.class);
+        var logger = mock(Logger.class);
+        var podResource = mock(PodResource.class);
+        var pod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-succeeded")
+            .withNamespace("default")
+            .endMetadata()
+            .build();
+
+        var succeededPod = new PodBuilder(pod)
+            .withNewStatus()
+            .withPhase("Succeeded")
+            .endStatus()
+            .build();
+
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                return condition.test(succeededPod) ? succeededPod : null;
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, pod)).thenReturn(podResource);
+
+            var result = PodService.waitForCompletion(client, logger, pod, Duration.ofMinutes(10));
+
+            assertThat(result, is(succeededPod));
+            verify(podResource, never()).get();
+        }
+    }
+
+    @Test
+    void waitForCompletionShouldSucceedWhenPodReachesFailedPhaseNaturally() {
+        var client = mock(KubernetesClient.class);
+        var logger = mock(Logger.class);
+        var podResource = mock(PodResource.class);
+        var pod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-failed")
+            .withNamespace("default")
+            .endMetadata()
+            .build();
+
+        var failedPod = new PodBuilder(pod)
+            .withNewStatus()
+            .withPhase("Failed")
+            .endStatus()
+            .build();
+
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                return condition.test(failedPod) ? failedPod : null;
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, pod)).thenReturn(podResource);
+
+            var result = PodService.waitForCompletion(client, logger, pod, Duration.ofMinutes(10));
+
+            assertThat(result, is(failedPod));
+            verify(podResource, never()).get();
+        }
     }
 }
