@@ -97,6 +97,7 @@ dependencies {
     testImplementation "org.hamcrest:hamcrest"
     testImplementation "org.hamcrest:hamcrest-library"
     testImplementation 'org.mockito:mockito-junit-jupiter'
+    testImplementation 'io.fabric8:kubernetes-server-mock:7.9.0'
 }
 
 /**********************************************************************************************************************\

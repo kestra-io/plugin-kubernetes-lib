@@ -168,7 +168,7 @@ public final class PodService {
      * event ends Fabric8's wait immediately instead of waiting out the chunk timeout.
      */
     private static Predicate<Pod> terminateOnDeleted(Predicate<Pod> condition) {
-        return pod -> pod == null || (condition != null && condition.test(pod));
+        return pod -> pod == null || condition.test(pod);
     }
 
     public static Pod waitForContainersStartedOrCompleted(KubernetesClient client, Logger logger, Pod pod, Duration waitUntilRunning) {
@@ -233,8 +233,7 @@ public final class PodService {
             logger,
             pod,
             waitRunning,
-            terminateOnDeleted(j -> j != null &&
-                j.getStatus() != null &&
+            j -> j.getStatus() != null &&
                 j.getStatus().getContainerStatuses() != null &&
                 j.getStatus()
                     .getContainerStatuses()
@@ -245,7 +244,7 @@ public final class PodService {
                     .getContainerStatuses()
                     .stream()
                     .filter(containerStatus -> !containerStatus.getName().equals(except))
-                    .allMatch(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null))
+                    .allMatch(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getTerminated() != null)
         );
     }
 
@@ -255,9 +254,8 @@ public final class PodService {
             logger,
             pod,
             waitRunning,
-            terminateOnDeleted(j -> j != null &&
-                j.getStatus() != null &&
-                COMPLETED_PHASES.contains(j.getStatus().getPhase()))
+            j -> j.getStatus() != null &&
+                COMPLETED_PHASES.contains(j.getStatus().getPhase())
         );
     }
 
@@ -558,11 +556,9 @@ public final class PodService {
                     ? ioException
                     : new IOException("Failed to call '" + where + "'", retryFailed.getCause()))
                 .build()
-                // Stay on the result-predicate overload (rather than run(IOException.class, ...), which would
-                // narrow Failsafe's default "retry on any exception" to IOException only): fabric8 calls can
+                // The (result, throwable) overload retries any exception and a false result (fabric8 calls can
                 // throw KubernetesClientException and other non-IOException runtime errors that must still be
-                // retried the same way a bare `false` result is.
-                // Do not retry a KubernetesClientException with HTTP 404 (pod gone) - fail fast on attempt 1.
+                // retried), except a 404 KubernetesClientException (pod gone), which fails on the first attempt.
                 .run(
                     (result, throwable) -> {
                         if (is404(throwable)) {
