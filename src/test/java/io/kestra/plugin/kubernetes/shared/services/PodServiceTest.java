@@ -392,12 +392,16 @@ class PodServiceTest {
             .thenAnswer(invocation ->
             {
                 Predicate<Pod> predicate = invocation.getArgument(0);
-                return predicate.test(pod) ? pod : null;
+                if (predicate.test(pod)) {
+                    return pod;
+                }
+                throw new KubernetesClientTimeoutException(pod, 1L, TimeUnit.SECONDS);
             });
 
-        Pod result = PodService.waitForPodReady(client, pod, Duration.ofSeconds(1));
-
-        assertNull(result);
+        assertThrows(
+            KubernetesClientTimeoutException.class,
+            () -> PodService.waitForPodReady(client, pod, Duration.ofSeconds(1))
+        );
     }
 
     @Test
@@ -1356,6 +1360,154 @@ class PodServiceTest {
 
             assertThat(result, is(failedPod));
             verify(podResource, never()).get();
+        }
+    }
+
+    @Test
+    void waitForPodReadyShouldShortCircuitWhenPodIsDeletedDuringWait() {
+        var client = mock(KubernetesClient.class);
+        var podResource = mock(PodResource.class);
+        var pendingPod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-ready-deleted")
+            .withNamespace("default")
+            .endMetadata()
+            .withNewSpec()
+            .addNewContainer()
+            .withName("main")
+            .endContainer()
+            .endSpec()
+            .withNewStatus()
+            .withPhase("Pending")
+            .endStatus()
+            .build();
+
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                if (condition.test(null)) {
+                    return null;
+                }
+                throw new KubernetesClientTimeoutException(pendingPod, 300L, TimeUnit.SECONDS);
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, pendingPod)).thenReturn(podResource);
+
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForPodReady(client, pendingPod, Duration.ofMinutes(10))
+            );
+
+            assertThat(exception.getMessage(), is("Pod 'pod-ready-deleted' no longer exists while waiting for it to be ready; it was deleted or evicted outside this task, check the namespace events"));
+        }
+    }
+
+    @Test
+    void waitForPodReadyShouldSucceedWhenPodIsReady() {
+        var client = mock(KubernetesClient.class);
+        var podResource = mock(PodResource.class);
+        var readyPod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-ready")
+            .withNamespace("default")
+            .endMetadata()
+            .withNewSpec()
+            .addNewContainer()
+            .withName("main")
+            .endContainer()
+            .endSpec()
+            .withNewStatus()
+            .withPhase("Running")
+            .addNewCondition()
+            .withType("ContainersReady")
+            .withStatus("True")
+            .endCondition()
+            .endStatus()
+            .build();
+
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                return condition.test(readyPod) ? readyPod : null;
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, readyPod)).thenReturn(podResource);
+
+            var result = PodService.waitForPodReady(client, readyPod, Duration.ofMinutes(10));
+
+            assertThat(result, is(readyPod));
+        }
+    }
+
+    @Test
+    void waitForInitContainerRunningShouldShortCircuitWhenPodIsDeletedDuringWait() {
+        var client = mock(KubernetesClient.class);
+        var podResource = mock(PodResource.class);
+        var pendingPod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-init-deleted")
+            .withNamespace("default")
+            .endMetadata()
+            .withNewStatus()
+            .withPhase("Pending")
+            .endStatus()
+            .build();
+
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                if (condition.test(null)) {
+                    return null;
+                }
+                throw new KubernetesClientTimeoutException(pendingPod, 300L, TimeUnit.SECONDS);
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, pendingPod)).thenReturn(podResource);
+
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForInitContainerRunning(client, pendingPod, "init-files", Duration.ofMinutes(10))
+            );
+
+            assertThat(exception.getMessage(), is("Pod 'pod-init-deleted' no longer exists while waiting for init container to start; it was deleted or evicted outside this task, check the namespace events"));
+        }
+    }
+
+    @Test
+    void waitForInitContainerRunningShouldSucceedWhenContainerIsRunning() {
+        var client = mock(KubernetesClient.class);
+        var podResource = mock(PodResource.class);
+        var initRunningPod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pod-init-running")
+            .withNamespace("default")
+            .endMetadata()
+            .withNewStatus()
+            .addNewInitContainerStatus()
+            .withName("init-files")
+            .withNewState()
+            .withNewRunning()
+            .endRunning()
+            .endState()
+            .endInitContainerStatus()
+            .endStatus()
+            .build();
+
+        when(podResource.waitUntilCondition(any(), anyLong(), Mockito.eq(TimeUnit.SECONDS)))
+            .thenAnswer(invocation -> {
+                Predicate<Pod> condition = invocation.getArgument(0);
+                return condition.test(initRunningPod) ? initRunningPod : null;
+            });
+
+        try (var podService = Mockito.mockStatic(PodService.class, Mockito.CALLS_REAL_METHODS)) {
+            podService.when(() -> PodService.podRef(client, initRunningPod)).thenReturn(podResource);
+
+            var result = PodService.waitForInitContainerRunning(client, initRunningPod, "init-files", Duration.ofMinutes(10));
+
+            assertThat(result, is(initRunningPod));
         }
     }
 }

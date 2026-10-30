@@ -100,28 +100,34 @@ public final class PodService {
     }
 
     public static Pod waitForInitContainerRunning(KubernetesClient client, Pod pod, String container, Duration waitUntilRunning) {
-        return PodService.podRef(client, pod)
+        var result = PodService.podRef(client, pod)
             .waitUntilCondition(
-                j -> j != null &&
+                terminateOnDeleted(j ->
                     j.getStatus() != null &&
                     j.getStatus().getInitContainerStatuses() != null &&
                     j.getStatus()
                         .getInitContainerStatuses()
                         .stream()
                         .filter(containerStatus -> containerStatus.getName().equals(container))
-                        .anyMatch(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getRunning() != null),
+                        .anyMatch(containerStatus -> containerStatus.getState() != null && containerStatus.getState().getRunning() != null)),
                 waitUntilRunning.toSeconds(),
                 TimeUnit.SECONDS
             );
+
+        if (result == null) {
+            throw new KubernetesClientException("Pod '" + pod.getMetadata().getName() + "' no longer exists while waiting for init container to start; it was deleted or evicted outside this task, check the namespace events");
+        }
+
+        return result;
     }
 
     public static Pod waitForPodReady(KubernetesClient client, Pod pod, Duration waitUntilRunning) {
-        boolean hasSidecar = pod.getSpec().getContainers().stream()
+        var hasSidecar = pod.getSpec().getContainers().stream()
             .anyMatch(c -> SIDECAR_FILES_CONTAINER_NAME.equals(c.getName()));
 
-        return PodService.podRef(client, pod)
+        var result = PodService.podRef(client, pod)
             .waitUntilCondition(
-                j -> j != null &&
+                terminateOnDeleted(j ->
                     j.getStatus() != null && (PodPhase.FAILED.value().equals(j.getStatus().getPhase()) ||
                         (j.getStatus().getContainerStatuses() != null &&
                             j.getStatus().getContainerStatuses().stream()
@@ -139,10 +145,16 @@ public final class PodService {
                                 podCondition -> ("ContainersReady".equals(podCondition.getType()) &&
                                     (hasSidecar || "True".equals(podCondition.getStatus()))) ||
                                     ("PodCompleted".equals(podCondition.getReason()))
-                            )),
+                            ))),
                 waitUntilRunning.toSeconds(),
                 TimeUnit.SECONDS
             );
+
+        if (result == null) {
+            throw new KubernetesClientException("Pod '" + pod.getMetadata().getName() + "' no longer exists while waiting for it to be ready; it was deleted or evicted outside this task, check the namespace events");
+        }
+
+        return result;
     }
 
     public static boolean isCompletedPhase(String phase) {

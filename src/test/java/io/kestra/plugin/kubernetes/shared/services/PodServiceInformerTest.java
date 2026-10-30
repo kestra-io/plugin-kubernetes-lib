@@ -91,4 +91,86 @@ class PodServiceInformerTest {
             executor.shutdownNow();
         }
     }
+
+    @Test
+    void waitForPodReadyShouldShortCircuitWhenPodIsDeletedDuringWaitAgainstRealInformer() {
+        var pod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pending-pod-ready-deleted")
+            .withNamespace("default")
+            .endMetadata()
+            .withNewSpec()
+            .addNewContainer()
+            .withName("main")
+            .endContainer()
+            .endSpec()
+            .withNewStatus()
+            .withPhase("Pending")
+            .endStatus()
+            .build();
+
+        client.pods().inNamespace("default").resource(pod).create();
+
+        var executor = Executors.newSingleThreadScheduledExecutor();
+        try {
+            executor.schedule(() -> {
+                client.pods().inNamespace("default").withName("pending-pod-ready-deleted").withGracePeriod(0).delete();
+            }, 1, TimeUnit.SECONDS);
+
+            long start = System.currentTimeMillis();
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForPodReady(client, pod, Duration.ofSeconds(60))
+            );
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertThat(exception.getMessage(), is("Pod 'pending-pod-ready-deleted' no longer exists while waiting for it to be ready; it was deleted or evicted outside this task, check the namespace events"));
+            assertTrue(elapsed < 10_000, "Expected wait to short-circuit in under 10s on deletion, but took " + elapsed + "ms");
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void waitForInitContainerRunningShouldShortCircuitWhenPodIsDeletedDuringWaitAgainstRealInformer() {
+        var pod = new PodBuilder()
+            .withNewMetadata()
+            .withName("pending-pod-init-deleted")
+            .withNamespace("default")
+            .endMetadata()
+            .withNewSpec()
+            .addNewInitContainer()
+            .withName("init-files")
+            .endInitContainer()
+            .addNewContainer()
+            .withName("main")
+            .endContainer()
+            .endSpec()
+            .withNewStatus()
+            .withPhase("Pending")
+            .endStatus()
+            .build();
+
+        client.pods().inNamespace("default").resource(pod).create();
+
+        var executor = Executors.newSingleThreadScheduledExecutor();
+        try {
+            executor.schedule(() -> {
+                client.pods().inNamespace("default").withName("pending-pod-init-deleted").withGracePeriod(0).delete();
+            }, 1, TimeUnit.SECONDS);
+
+            long start = System.currentTimeMillis();
+            var exception = assertThrows(
+                KubernetesClientException.class,
+                () -> PodService.waitForInitContainerRunning(client, pod, "init-files", Duration.ofSeconds(60))
+            );
+            long elapsed = System.currentTimeMillis() - start;
+
+            assertThat(exception.getMessage(), is("Pod 'pending-pod-init-deleted' no longer exists while waiting for init container to start; it was deleted or evicted outside this task, check the namespace events"));
+            assertTrue(elapsed < 10_000, "Expected wait to short-circuit in under 10s on deletion, but took " + elapsed + "ms");
+        } finally {
+            executor.shutdownNow();
+        }
+    }
 }
+
