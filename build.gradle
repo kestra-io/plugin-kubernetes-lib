@@ -57,7 +57,7 @@ dependencies {
     // Both HTTP backends: ClientService pins Vert.x by default and
     // switches to OkHttp only when a connection opts into HTTP/2 or a websocket keepalive ping.
     implementation 'io.fabric8:kubernetes-httpclient-vertx:7.9.0'
-    implementation 'io.fabric8:kubernetes-httpclient-okhttp:7.9.0'
+    implementation 'io.fabric8:kubernetes-httpclient-okhttp:8.0.0'
 }
 
 
