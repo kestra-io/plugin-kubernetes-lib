@@ -21,9 +21,15 @@ import io.fabric8.kubernetes.client.KubernetesClientException;
 import io.fabric8.kubernetes.client.dsl.LogWatch;
 import io.fabric8.kubernetes.client.dsl.PodResource;
 import lombok.Getter;
+import org.slf4j.Logger;
 
 public class PodLogService implements AutoCloseable {
-    private List<LogWatch> podLogs = new ArrayList<>();
+    // Bounds how long close() waits for an in-flight tick before the caller may close the client.
+    private static final long TERMINATION_TIMEOUT_SECONDS = 10;
+
+    // Guarded by podLogsLock: the scheduled tick adds watches while close() drains them.
+    private final List<LogWatch> podLogs = new ArrayList<>();
+    private final Object podLogsLock = new Object();
     private ScheduledExecutorService scheduledExecutor;
     @Getter
     private LoggingOutputStream outputStream;
@@ -33,6 +39,7 @@ public class PodLogService implements AutoCloseable {
     private long refreshInterval = 30;
     private AbstractLogConsumer logConsumer;
     private final AtomicBoolean closing = new AtomicBoolean(false);
+    private Logger logger;
 
     public void setLogConsumer(AbstractLogConsumer logConsumer) {
         this.logConsumer = logConsumer;
@@ -64,6 +71,7 @@ public class PodLogService implements AutoCloseable {
     public final void watch(KubernetesClient client, Pod pod, AbstractLogConsumer logConsumer, RunContext runContext, String containerName) {
 
         var logger = runContext.logger();
+        this.logger = logger;
 
         closing.set(false);
         scheduledExecutor = Executors.newSingleThreadScheduledExecutor(ThreadMainFactoryBuilder.build("k8s-log"));
@@ -103,10 +111,10 @@ public class PodLogService implements AutoCloseable {
 
                     lastReconnection.set(Instant.now(clock));
 
-                    if (podLogs != null) {
-                        podLogs.forEach(LogWatch::close);
-                        podLogs = new ArrayList<>();
+                    if (closing.get()) {
+                        return;
                     }
+                    closePodLogs();
 
                     PodResource podResource = PodService.podRef(client, pod);
 
@@ -124,8 +132,7 @@ public class PodLogService implements AutoCloseable {
                     containers.forEach(container ->
                     {
                         try {
-                            podLogs.add(
-                                podResource
+                            LogWatch watch = podResource
                                     .inContainer(container.getName())
                                     // The runner already waits for the pod to become Ready with its full
                                     // waitUntilRunning budget (PodService#waitForPodReady /
@@ -140,8 +147,8 @@ public class PodLogService implements AutoCloseable {
                                     .sinceTime(
                                         lastTimestamp != null ? lastTimestamp.plusNanos(1).toString() : null
                                     )
-                                    .watchLog(outputStream)
-                            );
+                                    .watchLog(outputStream);
+                            registerPodLog(watch);
                         } catch (KubernetesClientException e) {
                             if (e.getCode() == 404) {
                                 logger.info("Pod no longer exists, stopping log collection");
@@ -292,17 +299,44 @@ public class PodLogService implements AutoCloseable {
             }
         }
 
+        if (scheduledExecutor != null) {
+            scheduledExecutor.shutdownNow();
+            // Let an in-flight tick finish registering its watch before the drain below.
+            try {
+                if (!scheduledExecutor.awaitTermination(TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    logger.warn("Log collection executor did not terminate within {}s", TERMINATION_TIMEOUT_SECONDS);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        // A watch registered after this drain is closed by registerPodLog() itself.
+        closePodLogs();
+
         if (thread != null) {
             thread.interrupt();
             thread = null;
         }
+    }
 
-        if (podLogs != null) {
-            podLogs.forEach(LogWatch::close);
+    private void registerPodLog(LogWatch watch) {
+        synchronized (podLogsLock) {
+            if (!closing.get()) {
+                podLogs.add(watch);
+                return;
+            }
         }
+        // The service is closing: nobody will drain this watch, so close it right here.
+        watch.close();
+    }
 
-        if (scheduledExecutor != null) {
-            scheduledExecutor.shutdownNow();
+    private void closePodLogs() {
+        List<LogWatch> toClose;
+        synchronized (podLogsLock) {
+            toClose = new ArrayList<>(podLogs);
+            podLogs.clear();
         }
+        toClose.forEach(LogWatch::close);
     }
 }
