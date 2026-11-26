@@ -22,10 +22,12 @@ import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 
@@ -71,6 +73,7 @@ public final class PodService {
     private static final Duration CONFLICT_RETRY_MAX_DELAY = Duration.ofSeconds(2);
 
     public static final Duration DEFAULT_RETRY_MAX_DURATION = Duration.ofSeconds(60);
+    private static final Duration MARKER_EXIT_WAIT = Duration.ofSeconds(5);
 
     private static final String INIT_FILES_CONTAINER_NAME = "init-files";
 
@@ -916,16 +919,9 @@ public final class PodService {
                 e.addSuppressed(lookupError);
                 throw e;
             }
-            boolean initContainerSucceeded = current != null &&
-                current.getStatus() != null &&
-                current.getStatus().getInitContainerStatuses() != null &&
-                current.getStatus().getInitContainerStatuses().stream()
-                    .filter(cs -> INIT_FILES_CONTAINER_NAME.equals(cs.getName()))
-                    .anyMatch(
-                        cs -> cs.getState() != null &&
-                            cs.getState().getTerminated() != null &&
-                            Integer.valueOf(0).equals(cs.getState().getTerminated().getExitCode())
-                    );
+            boolean initContainerSucceeded = terminatedState(current, INIT_FILES_CONTAINER_NAME)
+                .map(terminated -> Integer.valueOf(0).equals(terminated.getExitCode()))
+                .orElse(false);
             if (initContainerSucceeded) {
                 logger.debug("uploadMarker exec failed but init container exited with code 0, marker was received");
             } else {
@@ -1196,20 +1192,62 @@ public final class PodService {
             throw new IOException("Unable to create the marker file: " + markerFile.getAbsolutePath());
         }
 
+        var retrying = new AtomicBoolean(false);
         withRetries(
             logger,
             "uploadMarker",
-            () -> podResource
-                .inContainer(container)
-                .withReadyWaitTimeout(0)
-                .file("/kestra/" + marker)
-                .upload(markerFile.toPath())
+            () -> {
+                // The container exits as soon as it sees the marker, often before the exec reports success:
+                // don't exec into it again, the API server only answers 500 after ~20s.
+                if (retrying.getAndSet(true) && hasExitedSuccessfully(podResource, container)) {
+                    logger.debug("{} container already exited with code 0, {} marker was received", container, marker);
+                    return true;
+                }
+                return podResource
+                    .inContainer(container)
+                    .withReadyWaitTimeout(0)
+                    .file("/kestra/" + marker)
+                    .upload(markerFile.toPath());
+            }
         );
 
         if (!markerFile.delete()) {
             logger.debug("Unable to delete the marker file: {}", markerFile.getAbsolutePath());
         }
         logger.debug(marker + " marker uploaded");
+    }
+
+    // Gives the kubelet a moment to report the exit, it lags the container by about a second.
+    private static boolean hasExitedSuccessfully(PodResource podResource, String container) {
+        Pod pod;
+        try {
+            pod = podResource.waitUntilCondition(
+                p -> p == null || terminatedState(p, container).isPresent(),
+                MARKER_EXIT_WAIT.toSeconds(),
+                TimeUnit.SECONDS
+            );
+        } catch (KubernetesClientTimeoutException e) {
+            return false;
+        }
+        return terminatedState(pod, container)
+            .map(terminated -> Integer.valueOf(0).equals(terminated.getExitCode()))
+            .orElse(false);
+    }
+
+    private static Optional<ContainerStateTerminated> terminatedState(Pod pod, String container) {
+        if (pod == null || pod.getStatus() == null) {
+            return Optional.empty();
+        }
+        return Stream.concat(
+                Optional.ofNullable(pod.getStatus().getInitContainerStatuses()).orElse(List.of()).stream(),
+                Optional.ofNullable(pod.getStatus().getContainerStatuses()).orElse(List.of()).stream()
+            )
+            .filter(containerStatus -> container.equals(containerStatus.getName()))
+            .map(ContainerStatus::getState)
+            .filter(Objects::nonNull)
+            .map(ContainerState::getTerminated)
+            .filter(Objects::nonNull)
+            .findFirst();
     }
 
     /**
