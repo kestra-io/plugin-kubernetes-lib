@@ -29,6 +29,7 @@ import io.fabric8.kubernetes.api.model.ContainerStatus;
 import io.fabric8.kubernetes.api.model.ContainerStatusBuilder;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodBuilder;
+import io.fabric8.kubernetes.client.KubernetesClientTimeoutException;
 import io.fabric8.kubernetes.client.dsl.ContainerResource;
 import io.fabric8.kubernetes.client.dsl.CopyOrReadable;
 import io.fabric8.kubernetes.client.dsl.ExecWatch;
@@ -169,6 +170,57 @@ class PodServiceUploadInputFilesTest {
                 PodService.uploadInputFiles(runContext, podResource, logger, localBaseDir, CONTAINER_WORKING_DIR, List.of())
             );
         }
+    }
+
+    @Test
+    void shouldNotRetryMarkerUploadIntoContainerThatAlreadyExited(@TempDir Path localBaseDir) throws Exception {
+        PodResource podResource = Mockito.mock(PodResource.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Logger logger = Mockito.mock(Logger.class);
+
+        Mockito.when(podResource.inContainer("out-files")).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(0)).thenReturn(container);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        // The exec stream dies with the container before reporting success.
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(false);
+
+        Pod exitedPod = new PodBuilder()
+            .withNewStatus()
+                .withContainerStatuses(new ContainerStatusBuilder()
+                    .withName("out-files")
+                    .withState(new ContainerStateBuilder()
+                        .withTerminated(new ContainerStateTerminatedBuilder().withExitCode(0).build())
+                        .build())
+                    .build())
+            .endStatus()
+            .build();
+        Mockito.when(podResource.waitUntilCondition(Mockito.any(), Mockito.anyLong(), Mockito.any())).thenReturn(exitedPod);
+
+        PodService.uploadMarker(runContext(localBaseDir), podResource, logger, "ended", "out-files");
+
+        Mockito.verify(fileUploader, Mockito.times(1)).upload(Mockito.any(Path.class));
+    }
+
+    @Test
+    void shouldRetryMarkerUploadWhenContainerIsStillRunning(@TempDir Path localBaseDir) throws Exception {
+        PodResource podResource = Mockito.mock(PodResource.class);
+        ContainerResource container = Mockito.mock(ContainerResource.class);
+        CopyOrReadable fileUploader = Mockito.mock(CopyOrReadable.class);
+        Logger logger = Mockito.mock(Logger.class);
+
+        Mockito.when(podResource.inContainer(INIT_FILES_CONTAINER_NAME)).thenReturn(container);
+        Mockito.when(container.withReadyWaitTimeout(0)).thenReturn(container);
+        Mockito.when(container.file(Mockito.anyString())).thenReturn(fileUploader);
+        Mockito.when(fileUploader.upload(Mockito.any(Path.class))).thenReturn(false, true);
+
+        Pod pod = new PodBuilder().withNewMetadata().withName("pod").endMetadata().build();
+        Mockito.when(podResource.waitUntilCondition(Mockito.any(), Mockito.anyLong(), Mockito.any()))
+            .thenThrow(new KubernetesClientTimeoutException(pod, 5, TimeUnit.SECONDS));
+
+        PodService.uploadMarker(runContext(localBaseDir), podResource, logger, "ready", INIT_FILES_CONTAINER_NAME);
+
+        Mockito.verify(fileUploader, Mockito.times(2)).upload(Mockito.any(Path.class));
     }
 
     @Test
